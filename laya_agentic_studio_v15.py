@@ -221,12 +221,11 @@ class TypingIndicator(ctk.CTkFrame):
             c = tk.Canvas(self, width=8, height=8, highlightthickness=0, bg=PALETTE["bg_card"])
             c.grid(row=0, column=i, padx=3, pady=8)
             self._dots.append(c)
-        self._draw()
+        self._render_dots()
 
-    def _draw(self):
+    def _render_dots(self):
         for i, c in enumerate(self._dots):
             c.delete("all")
-            alpha = 0.9 if i == self._step % 3 else 0.25
             color = PALETTE["accent"] if i == self._step % 3 else PALETTE["text_lo"]
             c.create_oval(1, 1, 7, 7, fill=color, outline="")
 
@@ -238,7 +237,7 @@ class TypingIndicator(ctk.CTkFrame):
         if not self._running:
             return
         self._step += 1
-        self._draw()
+        self._render_dots()
         self.after(350, self._tick)
 
     def stop(self):
