@@ -620,10 +620,9 @@ class AgenticStudioApp(ctk.CTk):
         self._active_theme = self.db.get_setting("theme", "dark_navy")
         self._zoom = 0  # font zoom offset
 
-        # Apply persisted theme
-        global PALETTE
+        # Apply persisted theme — mutate module-level PALETTE dict in-place
         if self._active_theme in THEMES:
-            PALETTE = THEMES[self._active_theme]
+            PALETTE.update(THEMES[self._active_theme])
 
         self._build_menubar()
         self._build_title_bar()
@@ -1116,10 +1115,9 @@ class AgenticStudioApp(ctk.CTk):
     # THEME SYSTEM
     # --------------------------------------------------------
     def apply_theme(self, name):
-        global PALETTE
         if name not in THEMES:
             return
-        PALETTE = THEMES[name]
+        PALETTE.update(THEMES[name])  # mutate in-place — no global needed
         self._active_theme = name
         self.db.set_setting("theme", name)
         # Lightweight CTk appearance toggle
