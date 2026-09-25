@@ -787,12 +787,14 @@ class AgenticStudioApp(ctk.CTk):
                               padx=(6, 0), pady=(2, 2))
         self.left_panel.grid_propagate(False)
         self.left_panel.grid_columnconfigure(0, weight=1)
-        # Row weights: 0=datasrc hdr, 1=file list, 2=file btns,
-        #              3=model hdr, 4=inf model, 5=map model, 6=refresh btn,
-        #              7=ctrl hdr, 8=temp slider, 9=dir hdr, 10=directives,
-        #              11=run btn, 12=progress, 13=settings btn
-        for i, w in [(0,0),(1,1),(2,0),(3,0),(4,0),(5,0),(6,0),
-                     (7,0),(8,0),(9,0),(10,2),(11,0),(12,0),(13,0)]:
+        # Row weights: 0=sep, 1=file list, 2=file btns,
+        #              3=model hdr, 4=inf model, 5=map label+combo, 6=map combo, 7=refresh,
+        #              8=ctrl hdr, 9=temp slider,
+        #              10=export hdr, 11=export chk+entry, 12=browse btn,
+        #              13=dir hdr, 14=directives(flex), 15=run btn, 16=progress, 17=settings
+        for i, w in [(0,0),(1,1),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),
+                     (8,0),(9,0),(10,0),(11,0),(12,0),
+                     (13,0),(14,2),(15,0),(16,0),(17,0)]:
             self.left_panel.grid_rowconfigure(i, weight=w)
 
         # Glass top border on left panel
@@ -896,7 +898,43 @@ class AgenticStudioApp(ctk.CTk):
         self.temp_label.grid(row=1, column=0, sticky="w")
         self.update_temp_label(self.temp_var.get())
 
-        self._section_label_grid(10, "AGENT DIRECTIVES")
+        self._section_label_grid(10, "OUTPUT / EXPORT")
+
+        # Export checkbox + path entry on same row sub-frame
+        exp_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        exp_frame.grid(row=11, column=0, sticky="ew", padx=8, pady=(2, 2))
+        exp_frame.grid_columnconfigure(1, weight=1)
+        self.export_var = tk.BooleanVar(value=False)
+        self.output_path_var = ctk.StringVar()
+        ctk.CTkCheckBox(exp_frame, text="",
+                        variable=self.export_var,
+                        command=self._toggle_export,
+                        fg_color=PALETTE["accent"],
+                        hover_color=PALETTE["accent_hot"],
+                        width=22, height=22
+                        ).grid(row=0, column=0, padx=(0, 4))
+        self.output_entry = ctk.CTkEntry(exp_frame,
+                                         textvariable=self.output_path_var,
+                                         placeholder_text="Output .docx path…",
+                                         state="disabled",
+                                         fg_color=PALETTE["bg_input"],
+                                         text_color=PALETTE["text_hi"],
+                                         border_color=PALETTE["border"],
+                                         font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
+                                         height=28)
+        self.output_entry.grid(row=0, column=1, sticky="ew")
+        self.browse_out_btn = ctk.CTkButton(
+            self.left_panel, text="📁  Browse Output Path",
+            command=self.browse_output,
+            state="disabled",
+            fg_color="transparent",
+            hover_color=PALETTE["border"],
+            text_color=PALETTE["text_lo"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
+            height=24, corner_radius=4)
+        self.browse_out_btn.grid(row=12, column=0, sticky="e", padx=8, pady=(0, 4))
+
+        self._section_label_grid(13, "AGENT DIRECTIVES")
 
         self.prompt_text = ctk.CTkTextbox(self.left_panel,
                                           fg_color=PALETTE["bg_input"],
@@ -904,14 +942,14 @@ class AgenticStudioApp(ctk.CTk):
                                           border_color=PALETTE["border_hi"],
                                           border_width=1,
                                           font=ctk.CTkFont(size=FONT_SCALE["body"]))
-        self.prompt_text.grid(row=11, column=0, sticky="nsew", padx=8, pady=(2, 6))
+        self.prompt_text.grid(row=14, column=0, sticky="nsew", padx=8, pady=(2, 6))
         self.prompt_text.insert("0.0", "Compare the provided documents and extract common numbers.")
 
         # Gradient-effect Run button using Canvas
         self.run_canvas = tk.Canvas(self.left_panel, height=46,
                                     highlightthickness=0, bd=0,
                                     bg=PALETTE["bg_panel"])
-        self.run_canvas.grid(row=12, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.run_canvas.grid(row=15, column=0, sticky="ew", padx=8, pady=(0, 4))
         self.run_canvas.bind("<Configure>", self._draw_run_button)
         self.run_canvas.bind("<Button-1>", lambda e: self.start_pipeline())
         self.run_canvas.bind("<Enter>",
@@ -923,7 +961,6 @@ class AgenticStudioApp(ctk.CTk):
                                                mode="indeterminate",
                                                progress_color=PALETTE["accent_hot"],
                                                fg_color=PALETTE["border"], height=3)
-        # Hidden initially — shown via grid when processing
         self.progress_bar.set(0)
 
         ctk.CTkButton(self.left_panel, text="⚙  Settings",
@@ -933,11 +970,7 @@ class AgenticStudioApp(ctk.CTk):
                       text_color=PALETTE["text_lo"],
                       font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
                       height=28, corner_radius=4
-                      ).grid(row=13, column=0, sticky="ew", padx=8, pady=(0, 6))
-
-        # Export row (collapsible)
-        self.export_var = tk.BooleanVar(value=False)
-        self.output_path_var = ctk.StringVar()
+                      ).grid(row=17, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         # ---- RIGHT PANEL ----
         self.right_tabs = ctk.CTkTabview(self, corner_radius=6,
@@ -1323,6 +1356,11 @@ class AgenticStudioApp(ctk.CTk):
         if fn:
             self.output_path_var.set(fn)
 
+    def _toggle_export(self):
+        state = "normal" if self.export_var.get() else "disabled"
+        self.output_entry.configure(state=state)
+        self.browse_out_btn.configure(state=state)
+
     # --------------------------------------------------------
     # EXPORT & HISTORY MENU ACTIONS
     # --------------------------------------------------------
@@ -1548,7 +1586,7 @@ class AgenticStudioApp(ctk.CTk):
         self.send_btn.configure(state=state)
         if processing:
             self.run_canvas.configure(cursor="watch")
-            self.progress_bar.grid(row=12, column=0, sticky="ew",
+            self.progress_bar.grid(row=16, column=0, sticky="ew",
                                    padx=8, pady=(0, 2))
             self.progress_bar.start()
             self.set_status("Processing…", "busy")
@@ -1655,6 +1693,13 @@ class AgenticStudioApp(ctk.CTk):
         if not self.selected_files:
             messagebox.showerror("No Files", "Add at least one document first.")
             return
+        # Inject docx export directive if enabled
+        out_path = self.output_path_var.get().strip().replace("\\", "/")
+        if self.export_var.get() and out_path:
+            directives += (
+                f"\n\nCRITICAL DIRECTIVE: Write a complete `python-docx` script that saves "
+                f"the full analysis report to '{out_path}'. Wrap it in a ```python block."
+            )
         self.right_tabs.set("  💬 Workspace  ")
         self.after(0, lambda: self.toggle_processing_state(True))
         threading.Thread(target=self.run_initial_agent,
