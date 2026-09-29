@@ -153,6 +153,12 @@ try:
 except ImportError:
     missing_deps.append("pytesseract/PIL")
 
+try:
+    import speech_recognition as sr
+except ImportError:
+    missing_deps.append("SpeechRecognition")
+    sr = None
+
 # ============================================================
 # COMMIT 1 — EXTENDED DATABASE (7G)
 # ============================================================
@@ -216,6 +222,15 @@ class DatabaseManager:
                 (session_id, limit))
             rows = cur.fetchall()
         return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+    def search_history(self, query):
+        with sqlite3.connect(self.db_path) as c:
+            cur = c.execute(
+                "SELECT session_id, timestamp, role, content FROM chat_history "
+                "WHERE content LIKE ? ORDER BY id DESC LIMIT 50",
+                (f"%{query}%",))
+            rows = cur.fetchall()
+        return [{"session_id": r[0], "timestamp": r[1], "role": r[2], "content": r[3]} for r in rows]
 
     def get_setting(self, key, default=None):
         with sqlite3.connect(self.db_path) as c:
@@ -456,7 +471,7 @@ class MessageBubble(ctk.CTkFrame):
 
         outer = ctk.CTkFrame(self, fg_color=PALETTE["bg_deep"], corner_radius=0)
         outer.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
-        outer.grid_columnconfigure(0 if not is_user else 1, weight=1)
+        outer.grid_columnconfigure(0 if is_user else 1, weight=1)
 
         avatar = ctk.CTkLabel(outer, text="👤" if is_user else "🤖",
                                font=ctk.CTkFont(size=14),
@@ -617,6 +632,10 @@ class AgenticStudioApp(ctk.CTk):
         self._stream_label = None
         self._chat_row = 1
         self._msg_count = 0
+        self._general_chat_row = 1
+        self._general_stream_agent_frame = None
+        self._general_stream_text_acc = ""
+        self._general_stream_label = None
         self._active_theme = self.db.get_setting("theme", "dark_navy")
         self._zoom = 0  # font zoom offset
 
@@ -716,6 +735,8 @@ class AgenticStudioApp(ctk.CTk):
 
         # History
         hm = _menu()
+        hm.add_command(label="  Search Chat History", command=self._search_history_ui)
+        hm.add_separator()
         hm.add_command(label="  View Session Log",    command=self._view_session_log)
         hm.add_command(label="  View File Access Log",command=self._view_file_log)
         hm.add_command(label="  View Model Usage Log",command=self._view_model_log)
@@ -986,6 +1007,7 @@ class AgenticStudioApp(ctk.CTk):
                               padx=(4, 6), pady=(2, 2))
 
         self.tab_chat     = self.right_tabs.add("  💬 Workspace  ")
+        self.tab_general  = self.right_tabs.add("  🤖 General Chat  ")
         self.tab_terminal = self.right_tabs.add("  ⚙ Terminal  ")
         self.tab_preview  = self.right_tabs.add("  🔍 Preview  ")
 
@@ -1002,8 +1024,7 @@ class AgenticStudioApp(ctk.CTk):
         self.chat_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
         self.chat_scroll.grid_columnconfigure(0, weight=1)
 
-        # Bind mouse wheel directly for Windows
-        self.chat_scroll.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Removed direct MouseWheel bind to prevent sluggish/double scrolling
         self.chat_scroll.bind("<Prior>", lambda e: self._scroll_chat(-10))
         self.chat_scroll.bind("<Next>", lambda e: self._scroll_chat(10))
 
@@ -1035,6 +1056,12 @@ class AgenticStudioApp(ctk.CTk):
         self.chat_input.grid(row=0, column=0, sticky="ew", padx=10, ipady=11)
         self.chat_input.bind("<Return>", lambda e: self.send_followup())
 
+        self.mic_btn = ctk.CTkButton(input_bg, text="🎤", width=40, height=36,
+                                     fg_color="transparent", hover_color=PALETTE["border"],
+                                     text_color=PALETTE["text_hi"],
+                                     command=lambda: self._listen_to_mic(self.chat_input))
+        self.mic_btn.grid(row=0, column=1, padx=(4, 0), pady=6)
+
         self.send_btn = ctk.CTkButton(input_bg, text="Send ⏎",
                                       font=ctk.CTkFont(size=FONT_SCALE["small"],
                                                        weight="bold"),
@@ -1042,7 +1069,48 @@ class AgenticStudioApp(ctk.CTk):
                                       fg_color=PALETTE["accent"],
                                       hover_color=PALETTE["accent_hot"],
                                       command=self.send_followup)
-        self.send_btn.grid(row=0, column=1, padx=(4, 8), pady=6)
+        self.send_btn.grid(row=0, column=2, padx=(4, 8), pady=6)
+
+        # ---- GENERAL CHAT PANE ----
+        self.tab_general.grid_rowconfigure(0, weight=1)
+        self.tab_general.grid_columnconfigure(0, weight=1)
+
+        self.general_scroll = ctk.CTkScrollableFrame(
+            self.tab_general,
+            fg_color=PALETTE["bg_deep"],
+            scrollbar_fg_color=PALETTE["bg_glass"],
+            scrollbar_button_color=PALETTE["accent"],
+            scrollbar_button_hover_color=PALETTE["accent_hot"])
+        self.general_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
+        self.general_scroll.grid_columnconfigure(0, weight=1)
+
+        self._general_typing_ind = TypingIndicator(self.general_scroll)
+
+        gen_input_bg = ctk.CTkFrame(self.tab_general, fg_color=PALETTE["bg_glass"],
+                                    corner_radius=10, border_width=1, border_color=PALETTE["border_hi"])
+        gen_input_bg.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
+        gen_input_bg.grid_columnconfigure(0, weight=1)
+
+        self.general_input = ctk.CTkEntry(gen_input_bg,
+                                          placeholder_text="Chat with AI generally... (Enter to send)",
+                                          font=ctk.CTkFont(size=FONT_SCALE["body"]),
+                                          fg_color="transparent", border_width=0,
+                                          text_color=PALETTE["text_hi"])
+        self.general_input.grid(row=0, column=0, sticky="ew", padx=10, ipady=11)
+        self.general_input.bind("<Return>", lambda e: self.send_general_chat())
+
+        self.gen_mic_btn = ctk.CTkButton(gen_input_bg, text="🎤", width=40, height=36,
+                                         fg_color="transparent", hover_color=PALETTE["border"],
+                                         text_color=PALETTE["text_hi"],
+                                         command=lambda: self._listen_to_mic(self.general_input))
+        self.gen_mic_btn.grid(row=0, column=1, padx=(4, 0), pady=6)
+
+        self.gen_send_btn = ctk.CTkButton(gen_input_bg, text="Send ⏎",
+                                          font=ctk.CTkFont(size=FONT_SCALE["small"], weight="bold"),
+                                          width=86, height=36, corner_radius=8,
+                                          fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"],
+                                          command=self.send_general_chat)
+        self.gen_send_btn.grid(row=0, column=2, padx=(4, 8), pady=6)
 
         # Terminal
         self.tab_terminal.grid_rowconfigure(1, weight=1)
@@ -1201,12 +1269,67 @@ class AgenticStudioApp(ctk.CTk):
     # --------------------------------------------------------
     # WORKSPACE INTERACTIVITY (7F)
     # --------------------------------------------------------
-    def _on_mousewheel(self, event):
-        try:
-            self.chat_scroll._parent_canvas.yview_scroll(
-                int(-1 * (event.delta / 120)), "units")
-        except Exception:
-            pass
+    def _listen_to_mic(self, input_widget):
+        if sr is None:
+            messagebox.showerror("Error", "SpeechRecognition module is not installed.")
+            return
+            
+        def _do_listen():
+            recognizer = sr.Recognizer()
+            with sr.Microphone() as source:
+                self.after(0, lambda: self.set_status("Listening... Speak now.", "busy"))
+                try:
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
+                    text = recognizer.recognize_google(audio)
+                    self.after(0, lambda: _insert_text(text))
+                except sr.UnknownValueError:
+                    self.after(0, lambda: self.set_status("Could not understand audio", "error"))
+                except sr.RequestError:
+                    self.after(0, lambda: self.set_status("Could not request results", "error"))
+                except Exception as e:
+                    self.after(0, lambda: self.set_status(f"Microphone Error: {e}", "error"))
+                finally:
+                    self.after(2000, lambda: self.set_status("Idle", "idle"))
+                    
+        def _insert_text(text):
+            current = input_widget.get()
+            input_widget.delete(0, "end")
+            input_widget.insert(0, current + (" " if current else "") + text)
+            
+        threading.Thread(target=_do_listen, daemon=True).start()
+
+    def _search_history_ui(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Search Chat History")
+        win.geometry("700x500")
+        win.configure(fg_color=PALETTE["bg_panel"])
+        win.grab_set()
+        
+        search_frame = ctk.CTkFrame(win, fg_color="transparent")
+        search_frame.pack(fill="x", padx=10, pady=10)
+        
+        entry = ctk.CTkEntry(search_frame, placeholder_text="Search keyword...", fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+        results_box = ctk.CTkTextbox(win, fg_color=PALETTE["bg_deep"], text_color=PALETTE["text_hi"], font=ctk.CTkFont(family="Consolas", size=12))
+        results_box.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        def _do_search(event=None):
+            query = entry.get().strip()
+            if not query: return
+            res = self.db.search_history(query)
+            results_box.configure(state="normal")
+            results_box.delete("0.0", "end")
+            if not res:
+                results_box.insert("end", "No results found.")
+            else:
+                for r in res:
+                    results_box.insert("end", f"[{r['timestamp']}] {r['role'].upper()} (Session {r['session_id']}):\n{r['content']}\n{'-'*60}\n")
+            results_box.configure(state="disabled")
+            
+        entry.bind("<Return>", _do_search)
+        btn = ctk.CTkButton(search_frame, text="Search", command=_do_search, fg_color=PALETTE["accent"])
+        btn.pack(side="right")
 
     def _scroll_chat(self, units):
         try:
@@ -1405,6 +1528,11 @@ class AgenticStudioApp(ctk.CTk):
         for w in self.chat_scroll.winfo_children(): w.destroy()
         self._chat_row = 1
         self._typing_ind = TypingIndicator(self.chat_scroll)
+        
+        if hasattr(self, 'general_scroll'):
+            for w in self.general_scroll.winfo_children(): w.destroy()
+            self._general_chat_row = 1
+            self._general_typing_ind = TypingIndicator(self.general_scroll)
 
     def _view_session_log(self):
         self._open_log_viewer("Session Chat Log",
@@ -1495,7 +1623,7 @@ class AgenticStudioApp(ctk.CTk):
     # --------------------------------------------------------
     # CHAT HELPERS
     # --------------------------------------------------------
-    def append_to_chat(self, sender, text, tag=None):
+    def append_to_chat(self, sender, text, tag=None, chat_type="workspace"):
         if sender == "System":
             level = ("ok" if "✅" in text else "err" if "❌" in text
                      else "warn" if any(w in text for w in ("WARNING","WARN","warn")) else "info")
@@ -1503,60 +1631,106 @@ class AgenticStudioApp(ctk.CTk):
             return
 
         def _do():
+            is_gen = (chat_type == "general")
+            scroll_widget = self.general_scroll if is_gen else self.chat_scroll
+            current_row = self._general_chat_row if is_gen else self._chat_row
+            
             if sender == "User":
-                self._hide_typing()
-                b = MessageBubble(self.chat_scroll, "user", text,
+                if is_gen:
+                    self._general_typing_ind.stop()
+                    self._general_typing_ind.grid_remove()
+                else:
+                    self._hide_typing()
+                
+                b = MessageBubble(scroll_widget, "user", text,
                                   copy_callback=self._copy_to_clipboard)
-                b.grid(row=self._chat_row, column=0, sticky="ew", pady=2)
-                self._chat_row += 1
-                self._update_msg_count()
-                self.after(50, self._smooth_scroll_bottom)
+                b.grid(row=current_row, column=0, sticky="ew", pady=2)
+                
+                if is_gen:
+                    self._general_chat_row += 1
+                else:
+                    self._chat_row += 1
+                    self._update_msg_count()
+                
+                self.after(50, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
 
             elif sender == "Agent" and not tag:
-                self._hide_typing()
-                self._stream_text_acc = ""
-                frame = ctk.CTkFrame(self.chat_scroll,
+                if is_gen:
+                    self._general_typing_ind.stop()
+                    self._general_typing_ind.grid_remove()
+                    self._general_stream_text_acc = ""
+                else:
+                    self._hide_typing()
+                    self._stream_text_acc = ""
+                
+                frame = ctk.CTkFrame(scroll_widget,
                                      fg_color=PALETTE["bg_card"],
                                      corner_radius=12,
                                      border_width=1,
                                      border_color=PALETTE["border"])
-                frame.grid(row=self._chat_row, column=0, sticky="ew", pady=2)
+                frame.grid(row=current_row, column=0, sticky="ew", pady=2)
                 frame.grid_columnconfigure(0, weight=1)
                 ctk.CTkLabel(frame, text="🤖",
                              font=ctk.CTkFont(size=14),
                              text_color=PALETTE["accent"]
                              ).grid(row=0, column=0, sticky="nw", padx=10, pady=(8, 2))
-                self._stream_label = ctk.CTkLabel(frame, text="",
-                                                   wraplength=740,
-                                                   justify="left",
-                                                   font=ctk.CTkFont(size=FONT_SCALE["body"]),
-                                                   text_color=PALETTE["text_hi"])
-                self._stream_label.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
-                self._stream_agent_frame = frame
-                self._chat_row += 1
+                
+                lbl = ctk.CTkLabel(frame, text="",
+                                   wraplength=740,
+                                   justify="left",
+                                   font=ctk.CTkFont(size=FONT_SCALE["body"]),
+                                   text_color=PALETTE["text_hi"])
+                lbl.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+                
+                if is_gen:
+                    self._general_stream_agent_frame = frame
+                    self._general_stream_label = lbl
+                    self._general_chat_row += 1
+                else:
+                    self._stream_agent_frame = frame
+                    self._stream_label = lbl
+                    self._chat_row += 1
 
             elif sender == "Agent" and tag == "stream":
-                self._stream_text_acc += text
-                if self._stream_label:
-                    self._stream_label.configure(text=self._stream_text_acc)
-                self.after(30, self._smooth_scroll_bottom)
+                if is_gen:
+                    self._general_stream_text_acc += text
+                    if self._general_stream_label:
+                        self._general_stream_label.configure(text=self._general_stream_text_acc)
+                else:
+                    self._stream_text_acc += text
+                    if self._stream_label:
+                        self._stream_label.configure(text=self._stream_text_acc)
+                self.after(30, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
 
         self.after(0, _do)
 
-    def _finalise_agent_bubble(self, full_text):
+    def _finalise_agent_bubble(self, full_text, chat_type="workspace"):
         def _do():
-            if self._stream_agent_frame:
-                row_info = self._stream_agent_frame.grid_info()
-                row = row_info.get("row", self._chat_row - 1)
-                self._stream_agent_frame.destroy()
-                self._stream_agent_frame = None
-                self._stream_label = None
-                b = MessageBubble(self.chat_scroll, "agent", full_text,
+            is_gen = (chat_type == "general")
+            scroll_widget = self.general_scroll if is_gen else self.chat_scroll
+            frame = self._general_stream_agent_frame if is_gen else self._stream_agent_frame
+            row_idx = self._general_chat_row - 1 if is_gen else self._chat_row - 1
+            
+            if frame:
+                row_info = frame.grid_info()
+                row = row_info.get("row", row_idx)
+                frame.destroy()
+                
+                if is_gen:
+                    self._general_stream_agent_frame = None
+                    self._general_stream_label = None
+                else:
+                    self._stream_agent_frame = None
+                    self._stream_label = None
+                    
+                b = MessageBubble(scroll_widget, "agent", full_text,
                                   copy_callback=self._copy_to_clipboard,
                                   rerun_callback=self.execute_agent_code)
                 b.grid(row=row, column=0, sticky="ew", pady=2)
-                self._update_msg_count()
-                self.after(60, self._smooth_scroll_bottom)
+                
+                if not is_gen:
+                    self._update_msg_count()
+                self.after(60, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
         self.after(0, _do)
 
     def _show_typing(self):
@@ -1868,6 +2042,61 @@ class AgenticStudioApp(ctk.CTk):
 
         except Exception as e:
             self.append_to_terminal("err", f"ERROR: {e}")
+            self.set_status("Error", "error")
+        finally:
+            self.after(0, lambda: self.toggle_processing_state(False))
+
+    def send_general_chat(self):
+        if self.is_processing or self.is_executing: return
+        text = self.general_input.get().strip()
+        if not text: return
+        
+        self.general_input.delete(0, "end")
+        self.after(0, lambda: self.toggle_processing_state(True))
+        threading.Thread(target=self._process_general_chat, args=(text,), daemon=True).start()
+
+    def _process_general_chat(self, user_text):
+        try:
+            gen_session = f"gen_{self.session_id}"
+            self.append_to_chat("User", user_text, chat_type="general")
+            self.db.log_message(gen_session, "user", user_text)
+
+            history = self.db.get_session_history(gen_session, limit=15)
+            
+            messages = [{"role": "system", "content": "You are a general-purpose AI assistant. Provide helpful and concise answers."}]
+            for r in history:
+                role = "assistant" if r["role"] == "agent" else r["role"]
+                messages.append({"role": role, "content": r["content"]})
+
+            self.set_status("Reasoning (General)…", "busy")
+            self.after(0, lambda: self._general_typing_ind.grid(row=self._general_chat_row, column=0, sticky="w", padx=16, pady=4))
+            self.after(0, lambda: self._general_typing_ind.start())
+            self.after(60, lambda: self.general_scroll._parent_canvas.yview_moveto(1.0))
+
+            t0 = time.time()
+            stream = ollama.chat(
+                model=self.model_var.get(),
+                messages=messages,
+                options={"num_ctx": 16384, "temperature": round(self.temp_var.get(), 2)},
+                stream=True)
+
+            self.append_to_chat("Agent", "", chat_type="general")
+            full = ""; buf = ""
+            for chunk in stream:
+                tok = chunk["message"]["content"]
+                full += tok; buf += tok
+                if len(buf) > 20 or "\n" in buf:
+                    self.append_to_chat("Agent", buf, tag="stream", chat_type="general")
+                    buf = ""
+            if buf: self.append_to_chat("Agent", buf, tag="stream", chat_type="general")
+
+            ms = int((time.time() - t0) * 1000)
+            self.db.log_model_usage(gen_session, self.model_var.get(),
+                                    len(user_text), len(full), ms)
+            self._finalise_agent_bubble(full, chat_type="general")
+            self.db.log_message(gen_session, "agent", full)
+        except Exception as e:
+            self.append_to_terminal("err", f"GENERAL CHAT ERROR: {e}")
             self.set_status("Error", "error")
         finally:
             self.after(0, lambda: self.toggle_processing_state(False))
