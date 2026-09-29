@@ -47,6 +47,12 @@ Start the application:
 python laya_agentic_studio_v15.py
 ```
 
+## Ollama Setup
+
+In the app, open **Models → Ollama Setup** (or select **Ollama Setup** beside the model refresh button). Use **Check & Refresh Models** to connect to the local Ollama service, or enter a local model name and select **Pull** to download it. New users can select **Create Ollama Account**; for cloud models, select **Ollama Cloud Sign-in**, complete Ollama's sign-in in the new terminal window, then refresh the model list. Agentic Studio does not create a separate user account or store Ollama credentials.
+
+Ollama-hosted `gpt-oss` models are not the same service as OpenAI's hosted GPT models. This app currently connects to Ollama; it does not configure an OpenAI API account.
+
 The application creates `agentic_memory.db` in its working directory to store local history and settings. Keep this file private; it is excluded from Git by default.
 
 ## Project Files

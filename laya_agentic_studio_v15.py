@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 import tempfile
 import shutil
 import time
+import webbrowser
 
 # Force offline caching
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -855,6 +856,8 @@ class AgenticStudioApp(ctk.CTk):
 
         # Models
         mm = _menu()
+        mm.add_command(label="  Ollama Setup…", command=self.open_ollama_setup)
+        mm.add_separator()
         mm.add_command(label="  Refresh Available Models", command=self._refresh_models_ui)
         mm.add_separator()
         mm.add_command(label="  Set Inference Model…",     command=lambda: self.open_settings())
@@ -1019,14 +1022,24 @@ class AgenticStudioApp(ctk.CTk):
             command=lambda v: self.db.set_setting("map_model", v))
         self.map_combo.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 3))
 
-        ctk.CTkButton(self.left_panel, text="↺  Refresh Models",
-                      command=self._refresh_models_ui,
-                      fg_color="transparent",
-                      hover_color=PALETTE["border"],
-                      text_color=PALETTE["text_lo"],
-                      font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
-                      height=24, corner_radius=4
-                      ).grid(row=8, column=0, sticky="e", padx=8, pady=(0, 4))
+        model_actions = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        model_actions.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 4))
+        model_actions.grid_columnconfigure(0, weight=1)
+        model_actions.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(model_actions, text="↺ Refresh",
+                  command=self._refresh_models_ui,
+                  fg_color="transparent", hover_color=PALETTE["border"],
+                  text_color=PALETTE["text_lo"],
+                  font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
+                  height=24, corner_radius=4
+                  ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ctk.CTkButton(model_actions, text="Ollama Setup",
+                  command=self.open_ollama_setup,
+                  fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"],
+                  text_color=PALETTE["text_mid"],
+                  font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
+                  height=24, corner_radius=4
+                  ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
         self._section_label_grid(9, "INFERENCE CONTROL")
 
@@ -1400,6 +1413,180 @@ class AgenticStudioApp(ctk.CTk):
     def _refresh_models_ui(self):
         self.append_to_terminal("info", "Querying available models…")
         self.model_mgr.refresh(callback=self._on_models_refreshed)
+
+    def _set_setup_status(self, window, variable, message):
+        def update():
+            if window.winfo_exists():
+                variable.set(message)
+        self.after(0, update)
+
+    def open_ollama_setup(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Ollama Setup")
+        win.geometry("560x500")
+        win.resizable(False, False)
+        win.configure(fg_color=PALETTE["bg_panel"])
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="Connect to Ollama",
+                     font=ctk.CTkFont(size=FONT_SCALE["h1"], weight="bold"),
+                     text_color=PALETTE["text_hi"]).pack(pady=(22, 8))
+        ctk.CTkLabel(
+            win,
+            text="Use local models for on-device inference, or sign in to Ollama\n"
+                 "to enable its cloud models. Agentic Studio does not store credentials.",
+            justify="center", wraplength=500,
+            font=ctk.CTkFont(size=FONT_SCALE["body"]),
+            text_color=PALETTE["text_mid"]).pack(padx=24, pady=(0, 14))
+
+        status_var = ctk.StringVar(value="Checking Ollama at http://localhost:11434…")
+        ctk.CTkLabel(win, textvariable=status_var, anchor="w", justify="left",
+                     wraplength=500, text_color=PALETTE["text_hi"],
+                     font=ctk.CTkFont(size=FONT_SCALE["small"])
+                     ).pack(fill="x", padx=28, pady=(4, 10))
+
+        action_row = ctk.CTkFrame(win, fg_color="transparent")
+        action_row.pack(fill="x", padx=24, pady=4)
+        action_row.grid_columnconfigure(0, weight=1)
+        action_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkButton(
+            action_row, text="Check & Refresh Models",
+            command=lambda: self._check_ollama_connection(win, status_var),
+            fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"]
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        ctk.CTkButton(
+            action_row, text="Ollama Cloud Sign-in",
+            command=lambda: self._start_ollama_sign_in(win, status_var),
+            fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"]
+        ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
+
+        ctk.CTkLabel(win, text="Pull a local model",
+                     font=ctk.CTkFont(size=FONT_SCALE["body"], weight="bold"),
+                     text_color=PALETTE["text_hi"]).pack(anchor="w", padx=28, pady=(22, 5))
+        pull_row = ctk.CTkFrame(win, fg_color="transparent")
+        pull_row.pack(fill="x", padx=24)
+        model_entry = ctk.CTkEntry(
+            pull_row, placeholder_text="Model name, for example llama3.2",
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"])
+        model_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        pull_status = ctk.StringVar(value="Cloud models are provided by Ollama after sign-in; they do not need to be pulled.")
+        pull_button = ctk.CTkButton(
+            pull_row, text="Pull", width=74,
+            command=lambda: self._pull_ollama_model(
+                win, model_entry.get(), pull_status, pull_button),
+            fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"])
+        pull_button.pack(side="right")
+        ctk.CTkLabel(win, textvariable=pull_status, anchor="w", justify="left",
+                     wraplength=500, text_color=PALETTE["text_mid"],
+                     font=ctk.CTkFont(size=FONT_SCALE["small"])
+                     ).pack(fill="x", padx=28, pady=(8, 4))
+
+        footer = ctk.CTkFrame(win, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", padx=24, pady=18)
+        ctk.CTkButton(footer, text="Install Ollama",
+                      command=lambda: webbrowser.open("https://ollama.com/download"),
+                      fg_color="transparent", hover_color=PALETTE["border"],
+                      text_color=PALETTE["text_mid"], width=130
+                      ).pack(side="left")
+        ctk.CTkButton(footer, text="Create Ollama Account",
+                  command=lambda: webbrowser.open("https://ollama.com/signup"),
+                  fg_color="transparent", hover_color=PALETTE["border"],
+                  text_color=PALETTE["text_mid"], width=155
+                  ).pack(side="left", padx=4)
+        ctk.CTkButton(footer, text="Close", command=win.destroy,
+                      fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"],
+                      text_color=PALETTE["text_hi"], width=100
+                      ).pack(side="right")
+
+        self._check_ollama_connection(win, status_var)
+
+    def _check_ollama_connection(self, window, status_var):
+        self._set_setup_status(window, status_var, "Checking local Ollama…")
+
+        def check():
+            try:
+                if ollama is None:
+                    raise RuntimeError("The Python package 'ollama' is not installed.")
+                result = ollama.list()
+                models = result.get("models", [])
+                cloud_count = sum(
+                    "cloud" in model.get("name", "").lower()
+                    for model in models)
+                message = f"Connected. {len(models)} model(s) available."
+                if not cloud_count:
+                    message += " Sign in to Ollama to enable cloud models."
+                self._set_setup_status(window, status_var, message)
+                self.after(0, lambda: self.model_mgr.refresh(
+                    callback=self._on_models_refreshed))
+            except Exception as exc:
+                self._set_setup_status(
+                    window, status_var,
+                    f"Could not connect to local Ollama: {exc}")
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _start_ollama_sign_in(self, window, status_var):
+        executable = shutil.which("ollama")
+        if not executable:
+            webbrowser.open("https://ollama.com/download")
+            self._set_setup_status(
+                window, status_var,
+                "Ollama CLI was not found. Install Ollama, then reopen this setup.")
+            return
+        try:
+            if os.name == "nt":
+                subprocess.Popen(
+                    [executable], creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen([executable])
+            self._set_setup_status(
+                window, status_var,
+                "Ollama opened. Complete its sign-in prompts, then check and refresh models.")
+        except OSError as exc:
+            self._set_setup_status(
+                window, status_var, f"Could not start Ollama: {exc}")
+
+    def _pull_ollama_model(self, window, model_name, status_var, button):
+        model_name = model_name.strip()
+        if not model_name:
+            self._set_setup_status(window, status_var, "Enter a model name to pull.")
+            return
+        if ollama is None:
+            self._set_setup_status(
+                window, status_var,
+                "The Ollama Python package is missing. Install it with: python -m pip install ollama")
+            return
+
+        button.configure(state="disabled")
+        self._set_setup_status(window, status_var, f"Starting download for {model_name}…")
+
+        def pull():
+            try:
+                for progress in ollama.pull(model_name, stream=True):
+                    status = getattr(progress, "status", None)
+                    completed = getattr(progress, "completed", None)
+                    total = getattr(progress, "total", None)
+                    if isinstance(progress, dict):
+                        status = progress.get("status", status)
+                        completed = progress.get("completed", completed)
+                        total = progress.get("total", total)
+                    message = status or f"Downloading {model_name}…"
+                    if total and completed is not None:
+                        message += f" ({int(completed * 100 / total)}%)"
+                    self._set_setup_status(window, status_var, message)
+                self._set_setup_status(
+                    window, status_var, f"{model_name} is ready.")
+                self.after(0, lambda: self.model_mgr.refresh(
+                    callback=self._on_models_refreshed))
+            except Exception as exc:
+                self._set_setup_status(
+                    window, status_var, f"Model pull failed: {exc}")
+            finally:
+                self.after(0, lambda: button.configure(state="normal")
+                           if button.winfo_exists() else None)
+
+        threading.Thread(target=pull, daemon=True).start()
 
     # --------------------------------------------------------
     # WORKSPACE INTERACTIVITY (7F)
