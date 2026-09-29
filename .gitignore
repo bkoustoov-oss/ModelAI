@@ -6,3 +6,7 @@ __pycache__/
 *.db-shm
 *.db-wal
 agent_script_*.py
+/bak/
+/laya_agentic_studio_v3.py
+/laya_agentic_studio_v13.py
+/laya_agentic_studio_v14.py

@@ -29,4 +29,4 @@ The application creates `agentic_memory.db` in its working directory to store lo
 
 - `laya_agentic_studio_v15.py` is the current application entry point.
 - `AGENT.md` describes the architecture, workflows, and extension points.
-- `bak/` and older `laya_agentic_studio_v*.py` files are retained historical versions.
+- Older Python versions and local backups are personal copies and are not included in this repository.
