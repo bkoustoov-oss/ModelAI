@@ -14,10 +14,34 @@ A desktop workspace for analyzing documents and chatting with local Ollama model
 
 - Python 3.10 or newer
 - Ollama installed and running, with at least one compatible model pulled
-- Python packages used by the application (including CustomTkinter, Ollama, LARA, Paramiko, and the document/OCR packages listed in [AGENT.md](AGENT.md))
-- Tesseract OCR for image text extraction; OCR support is optional
+- Tesseract OCR installed separately for image text extraction; OCR support is optional
 
-Install the packages in your Python environment, then start the application:
+## Install
+
+From PowerShell in the project directory, create an environment and install the Python dependencies:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install customtkinter python-docx laya ollama Pillow pytesseract pdfplumber pandas openpyxl SpeechRecognition paramiko
+```
+
+Optional microphone input requires PyAudio:
+
+```powershell
+python -m pip install PyAudio
+```
+
+Install [Ollama](https://ollama.com/download) separately, then download a model, for example:
+
+```powershell
+ollama pull llama3.2
+```
+
+Install Tesseract OCR separately if image OCR is needed. The application checks the standard Windows install path `C:\Program Files\Tesseract-OCR\tesseract.exe`.
+
+Start the application:
 
 ```powershell
 python laya_agentic_studio_v15.py
