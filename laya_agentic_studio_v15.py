@@ -159,6 +159,12 @@ except ImportError:
     missing_deps.append("SpeechRecognition")
     sr = None
 
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
+    missing_deps.append("paramiko")
+
 # ============================================================
 # COMMIT 1 — EXTENDED DATABASE (7G)
 # ============================================================
@@ -600,6 +606,127 @@ class FileCard(ctk.CTkFrame):
 
 
 # ============================================================
+# SSH MANAGER
+# ============================================================
+class SSHManager:
+    def __init__(self, log_callback=None):
+        self.client = None
+        self.sftp = None
+        self.shell = None
+        self.log_callback = log_callback
+        
+    def log(self, level, msg):
+        if self.log_callback:
+            self.log_callback(level, msg)
+        else:
+            print(f"[{level}] {msg}")
+
+    def connect(self, host, port, username, password=None, key_file=None):
+        if not paramiko:
+            self.log("err", "Paramiko is not installed. Run: pip install paramiko")
+            return False
+            
+        try:
+            self.client = paramiko.SSHClient()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            
+            connect_kwargs = {
+                "hostname": host,
+                "port": int(port),
+                "username": username,
+                "timeout": 15
+            }
+            
+            if key_file:
+                pkey = None
+                # Try different key types
+                for key_class in [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey, paramiko.DSSKey]:
+                    try:
+                        pkey = key_class.from_private_key_file(key_file, password=password)
+                        break
+                    except Exception:
+                        pass
+                if pkey:
+                    connect_kwargs["pkey"] = pkey
+                else:
+                    self.log("err", "Could not parse key file. Ensure format is PEM/PPK supported by paramiko.")
+                    return False
+            elif password:
+                connect_kwargs["password"] = password
+                
+            self.log("info", f"SSH: Connecting to {username}@{host}:{port}...")
+            self.client.connect(**connect_kwargs)
+            
+            self.sftp = self.client.open_sftp()
+            self.shell = self.client.invoke_shell()
+            self.shell.setblocking(0)
+            
+            self.log("ok", f"SSH: Connected to {host}")
+            return True
+        except Exception as e:
+            self.log("err", f"SSH Connection failed: {e}")
+            self.disconnect()
+            return False
+
+    def disconnect(self):
+        if self.sftp:
+            try: self.sftp.close()
+            except: pass
+        if self.shell:
+            try: self.shell.close()
+            except: pass
+        if self.client:
+            try: self.client.close()
+            except: pass
+        self.sftp = None
+        self.shell = None
+        self.client = None
+        self.log("info", "SSH: Disconnected.")
+
+    def execute_command(self, cmd):
+        if not self.shell:
+            self.log("warn", "SSH: Not connected.")
+            return
+        try:
+            self.shell.send(cmd + "\n")
+        except Exception as e:
+            self.log("err", f"SSH: Command failed: {e}")
+
+    def read_shell(self):
+        if not self.shell:
+            return ""
+        try:
+            if self.shell.recv_ready():
+                return self.shell.recv(8192).decode('utf-8', errors='replace')
+        except Exception as e:
+            self.log("err", f"SSH: Read failed: {e}")
+            self.disconnect()
+        return ""
+
+    def upload(self, local_path, remote_path):
+        if not self.sftp: return False
+        try:
+            self.log("info", f"SSH: Uploading {local_path} -> {remote_path}")
+            self.sftp.put(local_path, remote_path)
+            self.log("ok", "SSH: Upload complete.")
+            return True
+        except Exception as e:
+            self.log("err", f"SSH: Upload failed: {e}")
+            return False
+
+    def download(self, remote_path, local_path):
+        if not self.sftp: return False
+        try:
+            self.log("info", f"SSH: Downloading {remote_path} -> {local_path}")
+            self.sftp.get(remote_path, local_path)
+            self.log("ok", "SSH: Download complete.")
+            return True
+        except Exception as e:
+            self.log("err", f"SSH: Download failed: {e}")
+            return False
+
+
+# ============================================================
 # MAIN APPLICATION
 # ============================================================
 class AgenticStudioApp(ctk.CTk):
@@ -621,6 +748,7 @@ class AgenticStudioApp(ctk.CTk):
         self.map_model_var = ctk.StringVar(value="gpt-oss:120b-cloud")
         self.db = DatabaseManager()
         self.model_mgr = ModelManager()
+        self.ssh_mgr = SSHManager(log_callback=self.append_to_terminal)
         self.session_id = str(uuid.uuid4())[:8]
         self.selected_files = []
         self.document_context = ""
@@ -636,6 +764,8 @@ class AgenticStudioApp(ctk.CTk):
         self._general_stream_agent_frame = None
         self._general_stream_text_acc = ""
         self._general_stream_label = None
+        self._workspace_history = []   # in-memory conversation cache
+        self._general_history = []     # in-memory general chat cache
         self._active_theme = self.db.get_setting("theme", "dark_navy")
         self._zoom = 0  # font zoom offset
 
@@ -730,7 +860,9 @@ class AgenticStudioApp(ctk.CTk):
         mm.add_command(label="  Set Inference Model…",     command=lambda: self.open_settings())
         mm.add_command(label="  Set Map-Reduce Model…",    command=lambda: self.open_settings())
         mm.add_separator()
-        mm.add_command(label="  SSH Remote (coming soon)", state="disabled")
+        # Enable the SSH Remote menu entry and switch to the SSH tab when clicked.
+        mm.add_command(label="  SSH Remote",
+               command=lambda: self.right_tabs.set("  🔌 SSH  "))
         self.menubar.add_cascade(label=" Models ", menu=mm)
 
         # History
@@ -808,14 +940,14 @@ class AgenticStudioApp(ctk.CTk):
                               padx=(6, 0), pady=(2, 2))
         self.left_panel.grid_propagate(False)
         self.left_panel.grid_columnconfigure(0, weight=1)
-        # Row weights: 0=sep, 1=file list, 2=file btns,
-        #              3=model hdr, 4=inf model, 5=map label+combo, 6=map combo, 7=refresh,
-        #              8=ctrl hdr, 9=temp slider,
-        #              10=export hdr, 11=export chk+entry, 12=browse btn,
-        #              13=dir hdr, 14=directives(flex), 15=run btn, 16=progress, 17=settings
-        for i, w in [(0,0),(1,1),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),
-                     (8,0),(9,0),(10,0),(11,0),(12,0),
-                     (13,0),(14,2),(15,0),(16,0),(17,0)]:
+        # Row weights: 0=sep, 1=datasrc hdr, 2=file list, 3=file btns,
+        #              4=model hdr, 5=inf model, 6=map label, 7=map combo, 8=refresh,
+        #              9=ctrl hdr, 10=temp slider,
+        #              11=export hdr, 12=export chk+entry, 13=browse btn,
+        #              14=dir hdr, 15=directives(flex), 16=run btn, 17=progress, 18=settings
+        for i, w in [(0,0),(1,0),(2,1),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0),
+                     (9,0),(10,0),(11,0),(12,0),(13,0),
+                     (14,0),(15,2),(16,0),(17,0),(18,0)]:
             self.left_panel.grid_rowconfigure(i, weight=w)
 
         # Glass top border on left panel
@@ -831,12 +963,12 @@ class AgenticStudioApp(ctk.CTk):
             corner_radius=6,
             scrollbar_fg_color=PALETTE["bg_panel"],
             height=110)
-        self.file_list_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.file_list_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 4))
         self.file_list_frame.grid_columnconfigure(0, weight=1)
 
         # File buttons
         bframe = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        bframe.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 6))
+        bframe.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
         bframe.grid_columnconfigure(0, weight=1)
         ctk.CTkButton(bframe, text="＋  Add Files", command=self.add_files,
                       fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"],
@@ -848,7 +980,7 @@ class AgenticStudioApp(ctk.CTk):
                       text_color=PALETTE["text_mid"], width=36, height=30, corner_radius=6
                       ).grid(row=0, column=1)
 
-        self._section_label_grid(3, "MODELS")
+        self._section_label_grid(4, "MODELS")
 
         # Inference model combo
         self.model_combo = ctk.CTkComboBox(
@@ -865,11 +997,11 @@ class AgenticStudioApp(ctk.CTk):
             dropdown_hover_color=PALETTE["accent"],
             font=ctk.CTkFont(size=FONT_SCALE["small"]),
             command=lambda v: self.db.set_setting("inference_model", v))
-        self.model_combo.grid(row=4, column=0, sticky="ew", padx=8, pady=(2, 3))
+        self.model_combo.grid(row=5, column=0, sticky="ew", padx=8, pady=(2, 3))
 
         ctk.CTkLabel(self.left_panel, text="Map-Reduce Model",
                      font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
-                     text_color=PALETTE["text_lo"]).grid(row=5, column=0,
+                     text_color=PALETTE["text_lo"]).grid(row=6, column=0,
                      sticky="w", padx=8, pady=(2, 0))
         self.map_combo = ctk.CTkComboBox(
             self.left_panel,
@@ -885,7 +1017,7 @@ class AgenticStudioApp(ctk.CTk):
             dropdown_hover_color=PALETTE["accent"],
             font=ctk.CTkFont(size=FONT_SCALE["small"]),
             command=lambda v: self.db.set_setting("map_model", v))
-        self.map_combo.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 3))
+        self.map_combo.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 3))
 
         ctk.CTkButton(self.left_panel, text="↺  Refresh Models",
                       command=self._refresh_models_ui,
@@ -894,13 +1026,13 @@ class AgenticStudioApp(ctk.CTk):
                       text_color=PALETTE["text_lo"],
                       font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
                       height=24, corner_radius=4
-                      ).grid(row=7, column=0, sticky="e", padx=8, pady=(0, 4))
+                      ).grid(row=8, column=0, sticky="e", padx=8, pady=(0, 4))
 
-        self._section_label_grid(8, "INFERENCE CONTROL")
+        self._section_label_grid(9, "INFERENCE CONTROL")
 
         # Temp slider
         temp_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        temp_frame.grid(row=9, column=0, sticky="ew", padx=8, pady=(2, 4))
+        temp_frame.grid(row=10, column=0, sticky="ew", padx=8, pady=(2, 4))
         temp_frame.grid_columnconfigure(0, weight=1)
         self.temp_var = tk.DoubleVar(value=float(self.db.get_setting("temperature", "0.2")))
         self.temp_slider = ctk.CTkSlider(temp_frame, from_=0.0, to=1.0,
@@ -919,11 +1051,11 @@ class AgenticStudioApp(ctk.CTk):
         self.temp_label.grid(row=1, column=0, sticky="w")
         self.update_temp_label(self.temp_var.get())
 
-        self._section_label_grid(10, "OUTPUT / EXPORT")
+        self._section_label_grid(11, "OUTPUT / EXPORT")
 
         # Export checkbox + path entry on same row sub-frame
         exp_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        exp_frame.grid(row=11, column=0, sticky="ew", padx=8, pady=(2, 2))
+        exp_frame.grid(row=12, column=0, sticky="ew", padx=8, pady=(2, 2))
         exp_frame.grid_columnconfigure(1, weight=1)
         self.export_var = tk.BooleanVar(value=False)
         self.output_path_var = ctk.StringVar()
@@ -953,9 +1085,9 @@ class AgenticStudioApp(ctk.CTk):
             text_color=PALETTE["text_lo"],
             font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
             height=24, corner_radius=4)
-        self.browse_out_btn.grid(row=12, column=0, sticky="e", padx=8, pady=(0, 4))
+        self.browse_out_btn.grid(row=13, column=0, sticky="e", padx=8, pady=(0, 4))
 
-        self._section_label_grid(13, "AGENT DIRECTIVES")
+        self._section_label_grid(14, "AGENT DIRECTIVES")
 
         self.prompt_text = ctk.CTkTextbox(self.left_panel,
                                           fg_color=PALETTE["bg_input"],
@@ -963,14 +1095,14 @@ class AgenticStudioApp(ctk.CTk):
                                           border_color=PALETTE["border_hi"],
                                           border_width=1,
                                           font=ctk.CTkFont(size=FONT_SCALE["body"]))
-        self.prompt_text.grid(row=14, column=0, sticky="nsew", padx=8, pady=(2, 6))
+        self.prompt_text.grid(row=15, column=0, sticky="nsew", padx=8, pady=(2, 6))
         self.prompt_text.insert("0.0", "Compare the provided documents and extract common numbers.")
 
         # Gradient-effect Run button using Canvas
         self.run_canvas = tk.Canvas(self.left_panel, height=46,
                                     highlightthickness=0, bd=0,
                                     bg=PALETTE["bg_panel"])
-        self.run_canvas.grid(row=15, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.run_canvas.grid(row=16, column=0, sticky="ew", padx=8, pady=(0, 4))
         self.run_canvas.bind("<Configure>", self._draw_run_button)
         self.run_canvas.bind("<Button-1>", lambda e: self.start_pipeline())
         self.run_canvas.bind("<Enter>",
@@ -991,7 +1123,7 @@ class AgenticStudioApp(ctk.CTk):
                       text_color=PALETTE["text_lo"],
                       font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
                       height=28, corner_radius=4
-                      ).grid(row=17, column=0, sticky="ew", padx=8, pady=(0, 6))
+                      ).grid(row=18, column=0, sticky="ew", padx=8, pady=(0, 6))
 
         # ---- RIGHT PANEL ----
         self.right_tabs = ctk.CTkTabview(self, corner_radius=6,
@@ -1010,6 +1142,7 @@ class AgenticStudioApp(ctk.CTk):
         self.tab_general  = self.right_tabs.add("  🤖 General Chat  ")
         self.tab_terminal = self.right_tabs.add("  ⚙ Terminal  ")
         self.tab_preview  = self.right_tabs.add("  🔍 Preview  ")
+        self.tab_ssh      = self.right_tabs.add("  🔌 SSH  ")
 
         # ---- COMMIT 6 — INTERACTIVE WORKSPACE (7F) ----
         self.tab_chat.grid_rowconfigure(0, weight=1)
@@ -1024,7 +1157,6 @@ class AgenticStudioApp(ctk.CTk):
         self.chat_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
         self.chat_scroll.grid_columnconfigure(0, weight=1)
 
-        # Removed direct MouseWheel bind to prevent sluggish/double scrolling
         self.chat_scroll.bind("<Prior>", lambda e: self._scroll_chat(-10))
         self.chat_scroll.bind("<Next>", lambda e: self._scroll_chat(10))
 
@@ -1156,6 +1288,9 @@ class AgenticStudioApp(ctk.CTk):
         self.preview_box.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.preview_box.insert("0.0",
             "Click a file card in the left panel to preview its extracted content.")
+
+        self._build_ssh_tab()
+        self._setup_scroll_bindings()
 
     def _draw_run_button(self, e=None):
         c = self.run_canvas
@@ -1343,6 +1478,33 @@ class AgenticStudioApp(ctk.CTk):
         except Exception:
             pass
 
+    def _setup_scroll_bindings(self):
+        """Bind mouse wheel scrolling for workspace and general chat panels."""
+        # Remove default CTkScrollableFrame canvas bindings to avoid double-scroll
+        for sf in (self.chat_scroll, self.general_scroll):
+            try:
+                sf._parent_canvas.unbind("<MouseWheel>")
+                sf.unbind("<MouseWheel>")
+            except Exception:
+                pass
+
+        def _on_mousewheel(event):
+            try:
+                w = event.widget
+                while w is not None:
+                    if w is self.chat_scroll._parent_canvas:
+                        self.chat_scroll._parent_canvas.yview_scroll(
+                            int(-1 * (event.delta / 120)), "units")
+                        return "break"
+                    if w is self.general_scroll._parent_canvas:
+                        self.general_scroll._parent_canvas.yview_scroll(
+                            int(-1 * (event.delta / 120)), "units")
+                        return "break"
+                    w = w.master
+            except Exception:
+                pass
+        self.bind_all("<MouseWheel>", _on_mousewheel)
+
     def _update_msg_count(self):
         self._msg_count += 1
         self._session_lbl.configure(
@@ -1527,12 +1689,20 @@ class AgenticStudioApp(ctk.CTk):
     def _clear_chat(self):
         for w in self.chat_scroll.winfo_children(): w.destroy()
         self._chat_row = 1
+        self._stream_agent_frame = None
+        self._stream_label = None
+        self._stream_text_acc = ""
         self._typing_ind = TypingIndicator(self.chat_scroll)
-        
+        self._workspace_history.clear()
+
         if hasattr(self, 'general_scroll'):
             for w in self.general_scroll.winfo_children(): w.destroy()
             self._general_chat_row = 1
+            self._general_stream_agent_frame = None
+            self._general_stream_label = None
+            self._general_stream_text_acc = ""
             self._general_typing_ind = TypingIndicator(self.general_scroll)
+            self._general_history.clear()
 
     def _view_session_log(self):
         self._open_log_viewer("Session Chat Log",
@@ -1710,24 +1880,30 @@ class AgenticStudioApp(ctk.CTk):
             scroll_widget = self.general_scroll if is_gen else self.chat_scroll
             frame = self._general_stream_agent_frame if is_gen else self._stream_agent_frame
             row_idx = self._general_chat_row - 1 if is_gen else self._chat_row - 1
-            
+
             if frame:
-                row_info = frame.grid_info()
-                row = row_info.get("row", row_idx)
-                frame.destroy()
-                
+                try:
+                    row_info = frame.grid_info()
+                    row = row_info.get("row", row_idx)
+                except Exception:
+                    row = row_idx
+                try:
+                    frame.destroy()
+                except Exception:
+                    pass
+
                 if is_gen:
                     self._general_stream_agent_frame = None
                     self._general_stream_label = None
                 else:
                     self._stream_agent_frame = None
                     self._stream_label = None
-                    
+
                 b = MessageBubble(scroll_widget, "agent", full_text,
                                   copy_callback=self._copy_to_clipboard,
                                   rerun_callback=self.execute_agent_code)
                 b.grid(row=row, column=0, sticky="ew", pady=2)
-                
+
                 if not is_gen:
                     self._update_msg_count()
                 self.after(60, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
@@ -1760,7 +1936,7 @@ class AgenticStudioApp(ctk.CTk):
         self.send_btn.configure(state=state)
         if processing:
             self.run_canvas.configure(cursor="watch")
-            self.progress_bar.grid(row=16, column=0, sticky="ew",
+            self.progress_bar.grid(row=17, column=0, sticky="ew",
                                    padx=8, pady=(0, 2))
             self.progress_bar.start()
             self.set_status("Processing…", "busy")
@@ -1867,6 +2043,10 @@ class AgenticStudioApp(ctk.CTk):
         if not self.selected_files:
             messagebox.showerror("No Files", "Add at least one document first.")
             return
+        if ollama is None:
+            messagebox.showerror("Missing Dependency",
+                "Ollama is not installed. Install with: pip install ollama")
+            return
         # Inject docx export directive if enabled
         out_path = self.output_path_var.get().strip().replace("\\", "/")
         if self.export_var.get() and out_path:
@@ -1884,6 +2064,7 @@ class AgenticStudioApp(ctk.CTk):
             self.append_to_terminal("info",
                 f"Pipeline started. {len(self.selected_files)} file(s).")
             self.db.log_message(self.session_id, "user", directives)
+            self._workspace_history.append({"role": "user", "content": directives})
             self.append_to_chat("User", directives)
 
             master_raw = ""
@@ -1966,6 +2147,7 @@ class AgenticStudioApp(ctk.CTk):
             self.db.log_model_usage(self.session_id, self.model_var.get(),
                                     len(directives), len(full), ms)
             self._finalise_agent_bubble(full)
+            self._workspace_history.append({"role": "agent", "content": full})
             self.db.log_message(self.session_id, "agent", full)
             self.db.log_query(self.session_id, directives, str(strategy),
                               full[:300])
@@ -1986,6 +2168,10 @@ class AgenticStudioApp(ctk.CTk):
         if not self.document_context:
             messagebox.showwarning("Not Ready", "Run Initialize Analysis first.")
             return
+        if ollama is None:
+            messagebox.showerror("Missing Dependency",
+                "Ollama is not installed. Install with: pip install ollama")
+            return
         self.chat_input.delete(0, "end")
         self.after(0, lambda: self.toggle_processing_state(True))
         threading.Thread(target=self._process_followup,
@@ -1996,17 +2182,21 @@ class AgenticStudioApp(ctk.CTk):
             self.append_to_chat("User", user_text)
             self.db.log_message(self.session_id, "user", user_text)
 
-            history = self.db.get_session_history(self.session_id, limit=10)
-            total = sum(len(r["content"]) for r in history)
-            if total > 160000:
-                self.append_to_terminal("warn",
-                    f"History trimmed (last 10 msgs, ~{total//4} tokens).")
+            # Append to in-memory cache
+            self._workspace_history.append({"role": "user", "content": user_text})
+
+            # Trim oldest messages when context exceeds safe limit
+            MAX_HISTORY_CHARS = 160000
+            while (len(self._workspace_history) > 2 and
+                   sum(len(m["content"]) for m in self._workspace_history) > MAX_HISTORY_CHARS):
+                self._workspace_history.pop(0)
+                self.append_to_terminal("info", "Trimmed oldest message from context window.")
 
             messages = [{"role": "system",
                          "content": (f"You are a helpful data agent.\n\n"
                                      f"Context:\n{self.document_context}\n\n"
                                      "Wrap Python scripts in ```python blocks.")}]
-            for r in history:
+            for r in self._workspace_history:
                 role = "assistant" if r["role"] == "agent" else r["role"]
                 messages.append({"role": role, "content": r["content"]})
 
@@ -2035,6 +2225,7 @@ class AgenticStudioApp(ctk.CTk):
             self.db.log_model_usage(self.session_id, self.model_var.get(),
                                     len(user_text), len(full), ms)
             self._finalise_agent_bubble(full)
+            self._workspace_history.append({"role": "agent", "content": full})
             self.db.log_message(self.session_id, "agent", full)
             self.db.upsert_session(self.session_id, len(self.selected_files),
                                    self._msg_count, self.model_var.get())
@@ -2050,7 +2241,11 @@ class AgenticStudioApp(ctk.CTk):
         if self.is_processing or self.is_executing: return
         text = self.general_input.get().strip()
         if not text: return
-        
+        if ollama is None:
+            messagebox.showerror("Missing Dependency",
+                "Ollama is not installed. Install with: pip install ollama")
+            return
+
         self.general_input.delete(0, "end")
         self.after(0, lambda: self.toggle_processing_state(True))
         threading.Thread(target=self._process_general_chat, args=(text,), daemon=True).start()
@@ -2061,10 +2256,17 @@ class AgenticStudioApp(ctk.CTk):
             self.append_to_chat("User", user_text, chat_type="general")
             self.db.log_message(gen_session, "user", user_text)
 
-            history = self.db.get_session_history(gen_session, limit=15)
-            
+            # Append to in-memory cache
+            self._general_history.append({"role": "user", "content": user_text})
+
+            # Trim if too long
+            MAX_HISTORY_CHARS = 120000
+            while (len(self._general_history) > 2 and
+                   sum(len(m["content"]) for m in self._general_history) > MAX_HISTORY_CHARS):
+                self._general_history.pop(0)
+
             messages = [{"role": "system", "content": "You are a general-purpose AI assistant. Provide helpful and concise answers."}]
-            for r in history:
+            for r in self._general_history:
                 role = "assistant" if r["role"] == "agent" else r["role"]
                 messages.append({"role": role, "content": r["content"]})
 
@@ -2094,12 +2296,172 @@ class AgenticStudioApp(ctk.CTk):
             self.db.log_model_usage(gen_session, self.model_var.get(),
                                     len(user_text), len(full), ms)
             self._finalise_agent_bubble(full, chat_type="general")
+            self._general_history.append({"role": "agent", "content": full})
             self.db.log_message(gen_session, "agent", full)
         except Exception as e:
             self.append_to_terminal("err", f"GENERAL CHAT ERROR: {e}")
             self.set_status("Error", "error")
         finally:
             self.after(0, lambda: self.toggle_processing_state(False))
+
+    # --------------------------------------------------------
+    # SSH UI INTEGRATION
+    # --------------------------------------------------------
+    def _build_ssh_tab(self):
+        self.tab_ssh.grid_columnconfigure(0, weight=1)
+        self.tab_ssh.grid_rowconfigure(1, weight=1)
+
+        # Connection Header
+        conn_frame = ctk.CTkFrame(self.tab_ssh, fg_color=PALETTE["bg_panel"])
+        conn_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        
+        ctk.CTkLabel(conn_frame, text="Host:").grid(row=0, column=0, padx=4, pady=4, sticky="e")
+        self.ssh_host = ctk.CTkEntry(conn_frame, width=120, fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.ssh_host.grid(row=0, column=1, padx=4, pady=4)
+        
+        ctk.CTkLabel(conn_frame, text="Port:").grid(row=0, column=2, padx=4, pady=4, sticky="e")
+        self.ssh_port = ctk.CTkEntry(conn_frame, width=50, fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.ssh_port.insert(0, "22")
+        self.ssh_port.grid(row=0, column=3, padx=4, pady=4)
+        
+        ctk.CTkLabel(conn_frame, text="User:").grid(row=0, column=4, padx=4, pady=4, sticky="e")
+        self.ssh_user = ctk.CTkEntry(conn_frame, width=100, fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.ssh_user.grid(row=0, column=5, padx=4, pady=4)
+        
+        ctk.CTkLabel(conn_frame, text="Pass/KeyPass:").grid(row=0, column=6, padx=4, pady=4, sticky="e")
+        self.ssh_pass = ctk.CTkEntry(conn_frame, width=100, show="*", fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.ssh_pass.grid(row=0, column=7, padx=4, pady=4)
+        
+        self.ssh_key_path = tk.StringVar()
+        ctk.CTkButton(conn_frame, text="🔑 Key", width=60, fg_color=PALETTE["accent"], command=self._ssh_browse_key).grid(row=0, column=8, padx=4, pady=4)
+        self.ssh_key_lbl = ctk.CTkLabel(conn_frame, text="No key", width=100)
+        self.ssh_key_lbl.grid(row=0, column=9, padx=4, pady=4)
+        
+        self.ssh_connect_btn = ctk.CTkButton(conn_frame, text="Connect", width=80, fg_color=PALETTE["accent"], command=self._ssh_toggle_connect)
+        self.ssh_connect_btn.grid(row=0, column=10, padx=(10, 4), pady=4)
+
+        # Tabs for Terminal vs File Transfer
+        self.ssh_tabs = ctk.CTkTabview(self.tab_ssh, corner_radius=6, segmented_button_selected_color=PALETTE["accent"])
+        self.ssh_tabs.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        term_tab = self.ssh_tabs.add("Terminal")
+        sftp_tab = self.ssh_tabs.add("SFTP (File Transfer)")
+        
+        # --- SSH Terminal ---
+        term_tab.grid_columnconfigure(0, weight=1)
+        term_tab.grid_rowconfigure(0, weight=1)
+        
+        self.ssh_term_box = ctk.CTkTextbox(term_tab, font=ctk.CTkFont(family="Consolas", size=FONT_SCALE["body"]), state="disabled", fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.ssh_term_box.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        
+        self.ssh_cmd_entry = ctk.CTkEntry(term_tab, placeholder_text="Enter command...", fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.ssh_cmd_entry.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
+        self.ssh_cmd_entry.bind("<Return>", self._ssh_send_cmd)
+        
+        # --- SSH SFTP ---
+        sftp_tab.grid_columnconfigure(0, weight=1)
+        sftp_tab.grid_columnconfigure(1, weight=1)
+        sftp_tab.grid_rowconfigure(1, weight=1)
+        
+        ctk.CTkLabel(sftp_tab, text="Local File (to upload):").grid(row=0, column=0, sticky="w", padx=4)
+        loc_frame = ctk.CTkFrame(sftp_tab, fg_color="transparent")
+        loc_frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        loc_frame.grid_columnconfigure(0, weight=1)
+        self.sftp_loc_entry = ctk.CTkEntry(loc_frame, fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.sftp_loc_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(loc_frame, text="Browse", width=60, fg_color=PALETTE["accent"], command=self._ssh_browse_local_upload).grid(row=0, column=1, padx=4)
+        
+        ctk.CTkLabel(sftp_tab, text="Remote File (to download):").grid(row=0, column=1, sticky="w", padx=4)
+        rem_frame = ctk.CTkFrame(sftp_tab, fg_color="transparent")
+        rem_frame.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
+        rem_frame.grid_columnconfigure(0, weight=1)
+        self.sftp_rem_entry = ctk.CTkEntry(rem_frame, fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"])
+        self.sftp_rem_entry.grid(row=0, column=0, sticky="ew")
+        
+        act_frame = ctk.CTkFrame(sftp_tab, fg_color="transparent")
+        act_frame.grid(row=2, column=0, columnspan=2, pady=10)
+        ctk.CTkButton(act_frame, text="Upload (Local -> Remote)", fg_color=PALETTE["accent"], command=self._ssh_upload).grid(row=0, column=0, padx=10)
+        ctk.CTkButton(act_frame, text="Download (Remote -> Local)", fg_color=PALETTE["accent"], command=self._ssh_download).grid(row=0, column=1, padx=10)
+
+        self._ssh_poll_job = None
+
+    def _ssh_browse_key(self):
+        fn = filedialog.askopenfilename(title="Select PEM/PPK Key", filetypes=[("Key Files", "*.pem *.ppk"), ("All Files", "*.*")])
+        if fn:
+            self.ssh_key_path.set(fn)
+            self.ssh_key_lbl.configure(text=os.path.basename(fn))
+
+    def _ssh_toggle_connect(self):
+        if self.ssh_mgr.client:
+            self.ssh_mgr.disconnect()
+            self.ssh_connect_btn.configure(text="Connect", fg_color=PALETTE["accent"])
+            if self._ssh_poll_job:
+                self.after_cancel(self._ssh_poll_job)
+                self._ssh_poll_job = None
+            self._ssh_append_term("\n[Disconnected]\n")
+        else:
+            h = self.ssh_host.get().strip()
+            p = self.ssh_port.get().strip()
+            u = self.ssh_user.get().strip()
+            pw = self.ssh_pass.get()
+            kf = self.ssh_key_path.get()
+            
+            if not h or not u:
+                messagebox.showerror("SSH Error", "Host and User are required.")
+                return
+                
+            def _connect_thread():
+                self.ssh_connect_btn.configure(state="disabled", text="Connecting...")
+                success = self.ssh_mgr.connect(h, p, u, pw if pw else None, kf if kf else None)
+                if success:
+                    self.after(0, lambda: self.ssh_connect_btn.configure(state="normal", text="Disconnect", fg_color="red"))
+                    self.after(0, self._ssh_poll_terminal)
+                else:
+                    self.after(0, lambda: self.ssh_connect_btn.configure(state="normal", text="Connect", fg_color=PALETTE["accent"]))
+                    
+            threading.Thread(target=_connect_thread, daemon=True).start()
+
+    def _ssh_append_term(self, text):
+        self.ssh_term_box.configure(state="normal")
+        self.ssh_term_box.insert("end", text)
+        self.ssh_term_box.see("end")
+        self.ssh_term_box.configure(state="disabled")
+
+    def _ssh_poll_terminal(self):
+        if self.ssh_mgr.client:
+            out = self.ssh_mgr.read_shell()
+            if out:
+                self._ssh_append_term(out)
+            self._ssh_poll_job = self.after(100, self._ssh_poll_terminal)
+        else:
+            self.ssh_connect_btn.configure(text="Connect", fg_color=PALETTE["accent"])
+
+    def _ssh_send_cmd(self, event=None):
+        cmd = self.ssh_cmd_entry.get()
+        if cmd and self.ssh_mgr.client:
+            self.ssh_mgr.execute_command(cmd)
+            self.ssh_cmd_entry.delete(0, "end")
+            
+    def _ssh_browse_local_upload(self):
+        fn = filedialog.askopenfilename(title="Select File to Upload")
+        if fn:
+            self.sftp_loc_entry.delete(0, "end")
+            self.sftp_loc_entry.insert(0, fn)
+            rem = self.sftp_rem_entry.get()
+            if not rem:
+                self.sftp_rem_entry.insert(0, "./" + os.path.basename(fn))
+
+    def _ssh_upload(self):
+        loc = self.sftp_loc_entry.get().strip()
+        rem = self.sftp_rem_entry.get().strip()
+        if loc and rem:
+            threading.Thread(target=self.ssh_mgr.upload, args=(loc, rem), daemon=True).start()
+
+    def _ssh_download(self):
+        rem = self.sftp_rem_entry.get().strip()
+        if not rem: return
+        fn = filedialog.asksaveasfilename(title="Save Download As", initialfile=os.path.basename(rem))
+        if fn:
+            threading.Thread(target=self.ssh_mgr.download, args=(rem, fn), daemon=True).start()
 
 
 if __name__ == "__main__":
