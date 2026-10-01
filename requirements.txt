@@ -1,0 +1,18 @@
+customtkinter
+python-docx
+laya
+ollama
+openai
+keyring
+Pillow
+pytesseract
+SpeechRecognition
+PyAudio
+paramiko
+pdfplumber
+pandas
+openpyxl
+matplotlib
+reportlab
+pyttsx3
+pywin32; sys_platform == "win32"

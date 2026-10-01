@@ -7,12 +7,15 @@ import subprocess
 import sys
 import threading
 import uuid
+import html
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 import tempfile
 import shutil
 import time
 import webbrowser
+from urllib.parse import urlsplit
 
 # Force offline caching
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -120,6 +123,14 @@ FILE_ICON_MAP = {
     ".png": "🖼", ".jpg": "🖼", ".jpeg": "🖼",
 }
 
+OUTPUT_FORMATS = {
+    "DOCX": ".docx",
+    "PDF": ".pdf",
+    "Text": ".txt",
+    "Markdown": ".md",
+    "HTML": ".html",
+}
+
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
@@ -146,6 +157,18 @@ except ImportError:
     ollama = None
 
 try:
+    from openai import OpenAI
+except ImportError:
+    missing_deps.append("openai")
+    OpenAI = None
+
+try:
+    import keyring
+except ImportError:
+    missing_deps.append("keyring")
+    keyring = None
+
+try:
     from PIL import Image
     import pytesseract
     _tess = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -159,6 +182,12 @@ try:
 except ImportError:
     missing_deps.append("SpeechRecognition")
     sr = None
+
+try:
+    import pyttsx3
+except ImportError:
+    missing_deps.append("pyttsx3")
+    pyttsx3 = None
 
 try:
     import paramiko
@@ -295,27 +324,161 @@ class DatabaseManager:
 # COMMIT 2 — MODEL MANAGER (7B)
 # ============================================================
 class ModelManager:
-    DEFAULT_MODELS = ["nemotron-3-ultra:cloud", "gpt-oss:120b-cloud",
-                      "llama3:latest", "mistral:latest", "phi3:latest"]
+    KEYRING_SERVICE = "LAYA Agentic Studio"
 
-    def __init__(self):
-        self._models: list[str] = self.DEFAULT_MODELS[:]
-        self._lock = threading.Lock()
+    def __init__(self, database=None):
+        self.database = database
+        self.provider_type = (database.get_setting("provider_type", "ollama")
+                              if database else "ollama")
+        self.endpoint = (database.get_setting(
+            "provider_endpoint", "http://localhost:11434")
+            if database else "http://localhost:11434")
+        self._credential_id = f"{self.provider_type}:{self.endpoint}"
+        self._api_key = self._load_api_key()
+        self._models: list[str] = []
+        self._lock = threading.RLock()
+        self._client = None
+
+    def _load_api_key(self):
+        if keyring is None:
+            return ""
+        try:
+            return keyring.get_password(self.KEYRING_SERVICE, self._credential_id) or ""
+        except Exception:
+            return ""
+
+    @property
+    def is_configured(self):
+        return bool(self.endpoint.strip())
+
+    def configure(self, provider_type, endpoint, api_key=None,
+                   clear_api_key=False):
+        provider_type = provider_type.strip().lower().replace(" ", "-")
+        if provider_type not in ("ollama", "openai-compatible"):
+            raise ValueError("Choose Ollama or an OpenAI-compatible provider.")
+        endpoint = endpoint.strip().rstrip("/")
+        parsed_endpoint = urlsplit(endpoint)
+        if (parsed_endpoint.scheme not in ("http", "https") or
+                not parsed_endpoint.hostname):
+            raise ValueError("Enter a valid endpoint URL beginning with http:// or https://")
+        if parsed_endpoint.username or parsed_endpoint.password:
+            raise ValueError("Put credentials in the API key field, not in the URL.")
+
+        credential_id = f"{provider_type}:{endpoint}"
+        if clear_api_key and keyring is not None:
+            try:
+                keyring.delete_password(self.KEYRING_SERVICE, credential_id)
+            except Exception:
+                pass
+            api_key = ""
+        elif api_key:
+            if keyring is None:
+                raise RuntimeError("Install keyring to securely store API keys.")
+            keyring.set_password(self.KEYRING_SERVICE, credential_id, api_key)
+
+        with self._lock:
+            previous_credential_id = self._credential_id
+            self.provider_type = provider_type
+            self.endpoint = endpoint
+            self._credential_id = credential_id
+            if api_key is not None:
+                self._api_key = api_key
+            elif credential_id != previous_credential_id:
+                self._api_key = self._load_api_key()
+            self._client = None
+        if self.database:
+            self.database.set_setting("provider_type", provider_type)
+            self.database.set_setting("provider_endpoint", endpoint)
+
+    def _get_client(self):
+        with self._lock:
+            if self._client is not None:
+                return self._client
+            if self.provider_type == "ollama":
+                if ollama is None:
+                    raise RuntimeError("Install the ollama package to use Ollama.")
+                headers = ({"Authorization": f"Bearer {self._api_key}"}
+                           if self._api_key else {})
+                self._client = ollama.Client(
+                    host=self.endpoint, headers=headers, timeout=20)
+            else:
+                if OpenAI is None:
+                    raise RuntimeError("Install the openai package to use this provider.")
+                self._client = OpenAI(
+                    base_url=self.endpoint, api_key=self._api_key or "local",
+                    timeout=20)
+            return self._client
+
+    @staticmethod
+    def _field(value, name, default=None):
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    def list_models(self):
+        client = self._get_client()
+        if self.provider_type == "ollama":
+            result = client.list()
+            items = self._field(result, "models", []) or []
+            names = [self._field(item, "model") or
+                     self._field(item, "name") for item in items]
+        else:
+            result = client.models.list()
+            items = self._field(result, "data", []) or []
+            names = [self._field(item, "id") for item in items]
+        return sorted({name for name in names if name})
 
     def refresh(self, callback=None):
         def _do():
+            error = None
             try:
-                if ollama:
-                    result = ollama.list()
-                    names = [m["name"] for m in result.get("models", [])]
-                    if names:
-                        with self._lock:
-                            self._models = names + [m for m in self.DEFAULT_MODELS if m not in names]
-            except Exception:
-                pass
+                names = self.list_models()
+            except Exception as exc:
+                names = []
+                error = str(exc)
+            with self._lock:
+                self._models = names
             if callback:
-                callback(self._models[:])
+                callback(names, error)
         threading.Thread(target=_do, daemon=True).start()
+
+    @staticmethod
+    def _ollama_message(response):
+        message = ModelManager._field(response, "message", {}) or {}
+        return {"message": {"content": ModelManager._field(message, "content", "") or ""}}
+
+    def chat(self, model, messages, options=None, stream=False):
+        options = options or {}
+        client = self._get_client()
+        if self.provider_type == "ollama":
+            response = client.chat(model=model, messages=messages,
+                                   options=options, stream=stream)
+            if stream:
+                return (self._ollama_message(chunk) for chunk in response)
+            return self._ollama_message(response)
+
+        request = {"model": model, "messages": messages, "stream": stream}
+        if "temperature" in options:
+            request["temperature"] = options["temperature"]
+        response = client.chat.completions.create(**request)
+        if stream:
+            def _normalized_stream():
+                for chunk in response:
+                    choices = self._field(chunk, "choices", []) or []
+                    if choices:
+                        delta = self._field(choices[0], "delta", {}) or {}
+                        content = self._field(delta, "content", "") or ""
+                        if content:
+                            yield {"message": {"content": content}}
+            return _normalized_stream()
+        choices = self._field(response, "choices", []) or []
+        message = self._field(choices[0], "message", {}) if choices else {}
+        return {"message": {"content": self._field(message, "content", "") or ""}}
+
+    def pull(self, model_name, stream=True):
+        if self.provider_type != "ollama":
+            raise RuntimeError("Model downloads are available only for Ollama.")
+        return self._get_client().pull(model_name, stream=stream)
 
     def get_models(self):
         with self._lock:
@@ -350,6 +513,29 @@ def extract_dual_stream_from_file(file_path, log_callback=None):
     elif ext == '.docx':
         doc = Document(file_path)
         text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        return {"spatial": text, "raw": text}
+    elif ext == '.doc':
+        try:
+            import win32com.client
+        except ImportError:
+            raise ImportError("Legacy .doc preview requires pywin32 and Microsoft Word.")
+        word = None
+        document = None
+        try:
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            document = word.Documents.Open(
+                os.path.abspath(file_path), ReadOnly=True,
+                AddToRecentFiles=False)
+            text = document.Content.Text
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not open this .doc file. Microsoft Word must be installed.") from exc
+        finally:
+            if document is not None:
+                document.Close(False)
+            if word is not None:
+                word.Quit()
         return {"spatial": text, "raw": text}
     elif ext in ['.xlsx', '.csv']:
         try:
@@ -470,37 +656,59 @@ class TypingIndicator(ctk.CTkFrame):
 
 class MessageBubble(ctk.CTkFrame):
     def __init__(self, parent, sender, text, copy_callback=None,
-                 rerun_callback=None, **kw):
+                 rerun_callback=None, quote_callback=None,
+                 speak_callback=None, **kw):
         is_user = sender == "user"
         super().__init__(parent, fg_color=PALETTE["bg_deep"],
                          corner_radius=0, **kw)
         self.grid_columnconfigure(0, weight=1)
 
         outer = ctk.CTkFrame(self, fg_color=PALETTE["bg_deep"], corner_radius=0)
-        outer.grid(row=0, column=0, sticky="ew", padx=8, pady=4)
-        outer.grid_columnconfigure(0 if is_user else 1, weight=1)
+        outer.grid(row=0, column=0, sticky="ew", padx=18, pady=7)
+        outer.grid_columnconfigure(0, weight=1 if is_user else 0)
+        outer.grid_columnconfigure(1, weight=0)
+        outer.grid_columnconfigure(2, weight=0 if is_user else 1)
 
-        avatar = ctk.CTkLabel(outer, text="👤" if is_user else "🤖",
-                               font=ctk.CTkFont(size=14),
-                               text_color=PALETTE["text_mid"] if is_user else PALETTE["accent"])
-        avatar.grid(row=0, column=1 if is_user else 0,
-                    padx=(6, 0) if is_user else (0, 6), pady=4, sticky="n")
+        avatar = ctk.CTkLabel(
+            outer, text="YOU" if is_user else "AI", width=34, height=28,
+            corner_radius=14,
+            font=ctk.CTkFont(size=9, weight="bold"),
+            fg_color=PALETTE["border"] if is_user else PALETTE["accent_glow"],
+            text_color=PALETTE["text_hi"] if is_user else PALETTE["accent"])
+        bubble_col = 1
+        avatar_col = 2 if is_user else 0
+        avatar.grid(row=0, column=avatar_col, padx=8, pady=(18, 0), sticky="n")
 
-        bubble_col = 0 if is_user else 1
-        bg = PALETTE["accent"] if is_user else PALETTE["bg_card"]
+        bg = PALETTE["bg_glass"] if is_user else PALETTE["bg_card"]
         bubble = ctk.CTkFrame(outer, fg_color=bg, corner_radius=14,
                                border_width=1,
-                               border_color=PALETTE["border_hi"] if not is_user else bg)
+                               border_color=PALETTE["accent_glow"] if is_user
+                               else PALETTE["border"])
         bubble.grid(row=0, column=bubble_col, sticky="ew")
         bubble.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            bubble, text="YOU" if is_user else "LAYA",
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1, weight="bold"),
+            text_color=PALETTE["text_mid"] if is_user else PALETTE["accent"]
+        ).grid(row=0, column=0, sticky="w", padx=13, pady=(8, 0))
 
         # Right-click context menu
         self._text = text
         self._copy_cb = copy_callback
         self._rerun_cb = rerun_callback
-        bubble.bind("<Button-3>", self._show_context_menu)
+        self._quote_cb = quote_callback
+        self._speak_cb = speak_callback
+        self._code_blocks = re.findall(r'```(\w*)\n(.*?)\n```', text, re.DOTALL)
 
-        self._render_content(bubble, text, copy_callback, rerun_callback)
+        self._render_content(bubble, text, copy_callback, rerun_callback,
+                     is_user=is_user)
+        self._bind_context_menu(bubble)
+
+    def _bind_context_menu(self, widget):
+        widget.bind("<Button-3>", self._show_context_menu, add="+")
+        widget.bind("<Control-Button-1>", self._show_context_menu, add="+")
+        for child in widget.winfo_children():
+            self._bind_context_menu(child)
 
     def _show_context_menu(self, event):
         menu = tk.Menu(self, tearoff=0,
@@ -510,27 +718,151 @@ class MessageBubble(ctk.CTkFrame):
         if self._copy_cb:
             menu.add_command(label="  ⎘  Copy Message",
                              command=lambda: self._copy_cb(self._text))
-        code_blocks = re.findall(r'```python\n(.*?)\n```', self._text, re.DOTALL)
-        if code_blocks and self._copy_cb:
-            menu.add_command(label="  ⎘  Copy Code Block",
-                             command=lambda: self._copy_cb(code_blocks[0]))
-        if code_blocks and self._rerun_cb:
+        for index, (language, code) in enumerate(self._code_blocks, start=1):
+            if self._copy_cb:
+                label = f"  Copy {language or 'code'} block {index}"
+                menu.add_command(label=label,
+                                 command=lambda value=code: self._copy_cb(value))
+        python_blocks = [code for language, code in self._code_blocks
+                         if language.lower() == "python"]
+        if python_blocks and self._rerun_cb:
             menu.add_separator()
             menu.add_command(label="  ▶  Re-run Code",
                              command=lambda: self._rerun_cb(self._text))
-        menu.tk_popup(event.x_root, event.y_root)
+        if self._quote_cb:
+            menu.add_separator()
+            menu.add_command(label="  Quote in Chat Input",
+                             command=lambda: self._quote_cb(self._text))
+        if self._speak_cb:
+            menu.add_command(label="  Read Message Aloud",
+                             command=lambda: self._speak_cb(self._text))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
-    def _render_content(self, parent, text, copy_cb, rerun_cb):
+    def _insert_inline_text(self, widget, text):
+        token_pattern = re.compile(
+            r'(\*\*.+?\*\*|__.+?__|~~.+?~~|`[^`]+`|\*[^*]+\*|_[^_]+_)')
+        last = 0
+        for match in token_pattern.finditer(text):
+            if match.start() > last:
+                widget.insert("end", text[last:match.start()])
+            token = match.group(0)
+            if token.startswith(("**", "__")):
+                widget.insert("end", token[2:-2], "bold")
+            elif token.startswith("~~"):
+                widget.insert("end", token[2:-2], "strike")
+            elif token.startswith("`"):
+                widget.insert("end", token[1:-1], "inline_code")
+            else:
+                widget.insert("end", token[1:-1], "italic")
+            last = match.end()
+        if last < len(text):
+            widget.insert("end", text[last:])
+
+    def _render_rich_text(self, parent, text, row, is_user):
+        cleaned = html.unescape(text)
+        cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</(?:p|div|h[1-6]|li|tr)>\s*", "\n", cleaned,
+                         flags=re.IGNORECASE)
+        cleaned = re.sub(r"<li\b[^>]*>", "\n• ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", "", cleaned).replace("\r", "")
+        cleaned = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", cleaned)
+        lines = cleaned.strip().splitlines() or [""]
+        width_chars = (max(20, min(64, max(map(len, lines), default=20)))
+                       if is_user else 88)
+        visual_lines = sum(max(1, (len(line) + width_chars - 1) // width_chars)
+                           for line in lines)
+        body = tk.Text(
+            parent, wrap="word", width=width_chars, height=max(1, visual_lines),
+            padx=13, pady=6, bd=0, relief="flat", highlightthickness=0,
+            background=PALETTE["bg_glass"] if is_user else PALETTE["bg_card"],
+            foreground=PALETTE["text_hi"],
+            insertbackground=PALETTE["text_hi"],
+            font=("Segoe UI", FONT_SCALE["body"]), spacing1=2, spacing3=3)
+        body.grid(row=row, column=0, sticky="ew", padx=2, pady=(0, 7))
+        body.tag_configure("bold", font=("Segoe UI", FONT_SCALE["body"], "bold"),
+                           foreground=PALETTE["text_hi"])
+        body.tag_configure("italic", font=("Segoe UI", FONT_SCALE["body"], "italic"))
+        body.tag_configure("strike", overstrike=True)
+        body.tag_configure("inline_code", font=("Consolas", FONT_SCALE["mono"]),
+                           foreground="#A8FF78", background=PALETTE["bg_deep"])
+        body.tag_configure("heading", font=("Segoe UI", FONT_SCALE["h2"], "bold"),
+                           foreground=PALETTE["text_hi"], spacing1=8, spacing3=5)
+        body.tag_configure("subheading",
+                           font=("Segoe UI", FONT_SCALE["body"], "bold"),
+                           foreground=PALETTE["accent"], spacing1=6)
+        body.tag_configure("list_marker", foreground=PALETTE["accent"])
+        body.tag_configure("table_label", font=("Segoe UI", FONT_SCALE["small"], "bold"),
+                           foreground=PALETTE["accent"])
+
+        table_headers = None
+        in_table = False
+        separator_pattern = re.compile(r"^\s*\|?[\s:|+-]+\|?\s*$")
+        for index, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if not line:
+                body.insert("end", "\n")
+                in_table = False
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            is_separator = "|" in line and separator_pattern.match(line)
+            next_is_separator = (
+                index + 1 < len(lines) and "|" in lines[index + 1]
+                and separator_pattern.match(lines[index + 1]))
+            if is_separator:
+                in_table = True
+                continue
+            if "|" in line and (next_is_separator or in_table):
+                if next_is_separator:
+                    table_headers = cells
+                    in_table = True
+                    continue
+                body.insert("end", "• ", "list_marker")
+                for cell_index, value in enumerate(cells):
+                    if cell_index:
+                        body.insert("end", "   ")
+                    label = (table_headers[cell_index]
+                             if table_headers and cell_index < len(table_headers)
+                             else f"Item {cell_index + 1}")
+                    body.insert("end", f"{label}: ", "table_label")
+                    self._insert_inline_text(body, value)
+                body.insert("end", "\n")
+                continue
+
+            in_table = False
+            heading = re.match(r"^(#{1,3})\s+(.*)$", line)
+            bullet = re.match(r"^[-*+]\s+(.*)$", line)
+            numbered = re.match(r"^(\d+[.)])\s+(.*)$", line)
+            quote = re.match(r"^>\s?(.*)$", line)
+            if heading:
+                tag = "heading" if len(heading.group(1)) == 1 else "subheading"
+                self._insert_inline_text(body, heading.group(2))
+                body.tag_add(tag, "end-1l linestart", "end-1c")
+            elif bullet:
+                body.insert("end", "• ", "list_marker")
+                self._insert_inline_text(body, bullet.group(1))
+            elif numbered:
+                body.insert("end", f"{numbered.group(1)} ", "list_marker")
+                self._insert_inline_text(body, numbered.group(2))
+            elif quote:
+                self._insert_inline_text(body, quote.group(1))
+                body.tag_add("italic", "end-1l linestart", "end-1c")
+            else:
+                self._insert_inline_text(body, line.replace("|", "  ·  "))
+            body.insert("end", "\n")
+        body.configure(state="disabled")
+
+    def _render_content(self, parent, text, copy_cb, rerun_cb, is_user=False):
         code_pat = re.compile(r'```(\w*)\n(.*?)\n```', re.DOTALL)
-        last = 0; row = 0
+        last = 0
+        row = 1
         for m in code_pat.finditer(text):
             plain = text[last:m.start()].strip()
             if plain:
-                lbl = ctk.CTkLabel(parent, text=plain, wraplength=700,
-                                   justify="left",
-                                   font=ctk.CTkFont(size=FONT_SCALE["body"]),
-                                   text_color=PALETTE["text_hi"])
-                lbl.grid(row=row, column=0, sticky="w", padx=14, pady=(10, 4))
+                self._render_rich_text(parent, plain, row, is_user)
                 row += 1
             lang = m.group(1) or "code"
             code = m.group(2)
@@ -574,11 +906,7 @@ class MessageBubble(ctk.CTkFrame):
             last = m.end()
         trailing = text[last:].strip()
         if trailing:
-            lbl = ctk.CTkLabel(parent, text=trailing, wraplength=700,
-                               justify="left",
-                               font=ctk.CTkFont(size=FONT_SCALE["body"]),
-                               text_color=PALETTE["text_hi"])
-            lbl.grid(row=row, column=0, sticky="w", padx=14, pady=(8, 12))
+            self._render_rich_text(parent, trailing, row, is_user)
 
 
 class FileCard(ctk.CTkFrame):
@@ -745,16 +1073,52 @@ class AgenticStudioApp(ctk.CTk):
             pass
 
         # State
-        self.model_var = ctk.StringVar(value="nemotron-3-ultra:cloud")
-        self.map_model_var = ctk.StringVar(value="gpt-oss:120b-cloud")
         self.db = DatabaseManager()
-        self.model_mgr = ModelManager()
+        self.model_var = ctk.StringVar(
+            value=self.db.get_setting("inference_model", ""))
+        self.map_model_var = ctk.StringVar(
+            value=self.db.get_setting("map_model", ""))
+        self.model_mgr = ModelManager(self.db)
         self.ssh_mgr = SSHManager(log_callback=self.append_to_terminal)
         self.session_id = str(uuid.uuid4())[:8]
         self.selected_files = []
         self.document_context = ""
         self.is_processing = False
         self.is_executing = False
+        self._voice_busy = False
+        if self.db.get_setting("voice_wake_upgrade_v1") != "1":
+            self.voice_wake_enabled = True
+            self.db.set_setting("voice_wake_enabled", "1")
+            self.db.set_setting("voice_wake_upgrade_v1", "1")
+        else:
+            self.voice_wake_enabled = self.db.get_setting(
+                "voice_wake_enabled", "1") == "1"
+        self.voice_wake_phrase = self.db.get_setting(
+            "voice_wake_phrase", "Ok Chacha")
+        self.voice_language = self.db.get_setting("voice_language", "en-US")
+        self.voice_manual_target = self.db.get_setting(
+            "voice_manual_target", "Agent Directives")
+        self.voice_wake_target = self.db.get_setting(
+            "voice_wake_target", "Workspace Chat")
+        self.voice_auto_run_directives = self.db.get_setting(
+            "voice_auto_run_directives", "0") == "1"
+        self.voice_speak_replies = self.db.get_setting(
+            "voice_speak_replies", "0") == "1"
+        self.voice_gender = self.db.get_setting("voice_gender", "Female")
+        self.voice_rate = int(self.db.get_setting("voice_rate", "155"))
+        self._speech_lock = threading.RLock()
+        self._speech_generation = 0
+        self._speech_stop_event = threading.Event()
+        self._speech_engine = None
+        self._speech_active = False
+        self._voice_panel_speech_button = None
+        self._wake_stop_event = threading.Event()
+        self._wake_thread = None
+        self._voice_panel = None
+        self._voice_panel_entry = None
+        self._voice_panel_status = None
+        self._voice_panel_route = None
+        self._last_agent_response = ""
         self._status_text = tk.StringVar(value="Idle")
         self._stream_agent_frame = None
         self._stream_text_acc = ""
@@ -779,6 +1143,7 @@ class AgenticStudioApp(ctk.CTk):
         self._build_ui()
         self._build_status_bar()
         self._start_clock()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Restore saved model
         saved_model = self.db.get_setting("inference_model")
@@ -797,6 +1162,8 @@ class AgenticStudioApp(ctk.CTk):
 
         # Register session
         self.db.upsert_session(self.session_id, 0, 0, self.model_var.get())
+        if self.voice_wake_enabled:
+            self.after(900, self._start_wake_listener)
 
         # Keyboard shortcuts
         self.bind("<Control-n>", lambda e: self.new_session())
@@ -856,9 +1223,12 @@ class AgenticStudioApp(ctk.CTk):
 
         # Models
         mm = _menu()
-        mm.add_command(label="  Ollama Setup…", command=self.open_ollama_setup)
+        mm.add_command(label="  Provider / Endpoint…",
+                   command=self.open_provider_settings)
+        mm.add_command(label="  Refresh Available Models",
+                   command=self._refresh_models_ui)
         mm.add_separator()
-        mm.add_command(label="  Refresh Available Models", command=self._refresh_models_ui)
+        mm.add_command(label="  Ollama Setup…", command=self.open_ollama_setup)
         mm.add_separator()
         mm.add_command(label="  Set Inference Model…",     command=lambda: self.open_settings())
         mm.add_command(label="  Set Map-Reduce Model…",    command=lambda: self.open_settings())
@@ -912,6 +1282,20 @@ class AgenticStudioApp(ctk.CTk):
                                      font=("Consolas", 8),
                                      bg=PALETTE["bg_deep"], fg=PALETTE["text_lo"])
         self._session_lbl.pack()
+
+        self._voice_toggle_btn = tk.Button(
+            self.title_bar, command=self._toggle_wake_listener,
+            relief="flat", bd=0, padx=10, pady=4,
+            font=("Segoe UI", 8, "bold"))
+        self._voice_toggle_btn.grid(row=0, column=2, sticky="e", padx=10)
+        self._update_wake_button()
+        self._speech_stop_btn = tk.Button(
+            self.title_bar, text="■ Stop voice", command=self._stop_speech,
+            state="disabled", relief="flat", bd=0, padx=8, pady=4,
+            font=("Segoe UI", 8, "bold"),
+            bg=PALETTE["bg_card"], fg=PALETTE["text_mid"],
+            activebackground=PALETTE["danger"], activeforeground="#ffffff")
+        self._speech_stop_btn.grid(row=0, column=3, sticky="e", padx=(0, 10))
 
         # Drag
         self.title_bar.bind("<ButtonPress-1>", self._start_move)
@@ -1024,8 +1408,8 @@ class AgenticStudioApp(ctk.CTk):
 
         model_actions = ctk.CTkFrame(self.left_panel, fg_color="transparent")
         model_actions.grid(row=8, column=0, sticky="ew", padx=8, pady=(0, 4))
-        model_actions.grid_columnconfigure(0, weight=1)
-        model_actions.grid_columnconfigure(1, weight=1)
+        for column in range(3):
+            model_actions.grid_columnconfigure(column, weight=1)
         ctk.CTkButton(model_actions, text="↺ Refresh",
                   command=self._refresh_models_ui,
                   fg_color="transparent", hover_color=PALETTE["border"],
@@ -1033,13 +1417,20 @@ class AgenticStudioApp(ctk.CTk):
                   font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
                   height=24, corner_radius=4
                   ).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ctk.CTkButton(model_actions, text="Ollama Setup",
+        ctk.CTkButton(model_actions, text="Provider",
+                  command=self.open_provider_settings,
+                  fg_color=PALETTE["bg_card"], hover_color=PALETTE["accent_glow"],
+                  text_color=PALETTE["text_hi"],
+                  font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
+                  height=24, corner_radius=4
+                  ).grid(row=0, column=1, sticky="ew", padx=3)
+        ctk.CTkButton(model_actions, text="Ollama",
                   command=self.open_ollama_setup,
                   fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"],
                   text_color=PALETTE["text_mid"],
                   font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
                   height=24, corner_radius=4
-                  ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
+                  ).grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         self._section_label_grid(9, "INFERENCE CONTROL")
 
@@ -1069,9 +1460,11 @@ class AgenticStudioApp(ctk.CTk):
         # Export checkbox + path entry on same row sub-frame
         exp_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
         exp_frame.grid(row=12, column=0, sticky="ew", padx=8, pady=(2, 2))
-        exp_frame.grid_columnconfigure(1, weight=1)
+        exp_frame.grid_columnconfigure(2, weight=1)
         self.export_var = tk.BooleanVar(value=False)
         self.output_path_var = ctk.StringVar()
+        self.output_format_var = ctk.StringVar(
+            value=self.db.get_setting("output_format", "DOCX"))
         ctk.CTkCheckBox(exp_frame, text="",
                         variable=self.export_var,
                         command=self._toggle_export,
@@ -1079,16 +1472,27 @@ class AgenticStudioApp(ctk.CTk):
                         hover_color=PALETTE["accent_hot"],
                         width=22, height=22
                         ).grid(row=0, column=0, padx=(0, 4))
+        self.output_format_combo = ctk.CTkComboBox(
+            exp_frame, variable=self.output_format_var,
+            values=list(OUTPUT_FORMATS), width=86, height=28,
+            state="disabled", command=self._change_output_format,
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            button_color=PALETTE["accent"],
+            text_color=PALETTE["text_hi"],
+            dropdown_fg_color=PALETTE["bg_card"],
+            dropdown_text_color=PALETTE["text_hi"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1))
+        self.output_format_combo.grid(row=0, column=1, padx=(0, 4))
         self.output_entry = ctk.CTkEntry(exp_frame,
                                          textvariable=self.output_path_var,
-                                         placeholder_text="Output .docx path…",
+                                         placeholder_text="Output file path…",
                                          state="disabled",
                                          fg_color=PALETTE["bg_input"],
                                          text_color=PALETTE["text_hi"],
                                          border_color=PALETTE["border"],
                                          font=ctk.CTkFont(size=FONT_SCALE["small"]-1),
                                          height=28)
-        self.output_entry.grid(row=0, column=1, sticky="ew")
+        self.output_entry.grid(row=0, column=2, sticky="ew")
         self.browse_out_btn = ctk.CTkButton(
             self.left_panel, text="📁  Browse Output Path",
             command=self.browse_output,
@@ -1100,7 +1504,23 @@ class AgenticStudioApp(ctk.CTk):
             height=24, corner_radius=4)
         self.browse_out_btn.grid(row=13, column=0, sticky="e", padx=8, pady=(0, 4))
 
-        self._section_label_grid(14, "AGENT DIRECTIVES")
+        directive_header = ctk.CTkFrame(self.left_panel, fg_color="transparent",
+                                        height=26)
+        directive_header.grid(row=14, column=0, sticky="ew", padx=8,
+                              pady=(4, 0))
+        directive_header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            directive_header, text="AGENT DIRECTIVES",
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1, weight="bold"),
+            text_color=PALETTE["text_lo"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            directive_header, text="🎙 Dictate", width=78, height=23,
+            command=lambda: self._open_voice_panel(
+                route=self.voice_manual_target, capture=True, source="manual"),
+            fg_color=PALETTE["accent_glow"], hover_color=PALETTE["accent"],
+            text_color=PALETTE["text_hi"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1),
+            corner_radius=5).grid(row=0, column=1, sticky="e")
 
         self.prompt_text = ctk.CTkTextbox(self.left_panel,
                                           fg_color=PALETTE["bg_input"],
@@ -1204,7 +1624,8 @@ class AgenticStudioApp(ctk.CTk):
         self.mic_btn = ctk.CTkButton(input_bg, text="🎤", width=40, height=36,
                                      fg_color="transparent", hover_color=PALETTE["border"],
                                      text_color=PALETTE["text_hi"],
-                                     command=lambda: self._listen_to_mic(self.chat_input))
+                                     command=lambda: self._listen_to_mic(
+                                         self.chat_input, self.mic_btn))
         self.mic_btn.grid(row=0, column=1, padx=(4, 0), pady=6)
 
         self.send_btn = ctk.CTkButton(input_bg, text="Send ⏎",
@@ -1247,7 +1668,8 @@ class AgenticStudioApp(ctk.CTk):
         self.gen_mic_btn = ctk.CTkButton(gen_input_bg, text="🎤", width=40, height=36,
                                          fg_color="transparent", hover_color=PALETTE["border"],
                                          text_color=PALETTE["text_hi"],
-                                         command=lambda: self._listen_to_mic(self.general_input))
+                                         command=lambda: self._listen_to_mic(
+                                             self.general_input, self.gen_mic_btn))
         self.gen_mic_btn.grid(row=0, column=1, padx=(4, 0), pady=6)
 
         self.gen_send_btn = ctk.CTkButton(gen_input_bg, text="Send ⏎",
@@ -1304,6 +1726,8 @@ class AgenticStudioApp(ctk.CTk):
 
         self._build_ssh_tab()
         self._setup_scroll_bindings()
+        self.bind_all("<Button-3>", self._show_text_context_menu, add="+")
+        self.bind_all("<Control-Button-1>", self._show_text_context_menu, add="+")
 
     def _draw_run_button(self, e=None):
         c = self.run_canvas
@@ -1402,17 +1826,232 @@ class AgenticStudioApp(ctk.CTk):
     # --------------------------------------------------------
     # MODEL MANAGEMENT
     # --------------------------------------------------------
-    def _on_models_refreshed(self, models):
+    def _on_models_refreshed(self, models, error=None):
         def _upd():
             self.model_combo.configure(values=models)
             self.map_combo.configure(values=models)
-            self.append_to_terminal("info",
-                f"Model list refreshed: {len(models)} model(s) found.")
+            if models:
+                if self.model_var.get() not in models:
+                    self.model_var.set(models[0])
+                    self.db.set_setting("inference_model", models[0])
+                if self.map_model_var.get() not in models:
+                    self.map_model_var.set(models[0])
+                    self.db.set_setting("map_model", models[0])
+                self.append_to_terminal(
+                    "info", f"{self.model_mgr.provider_type} model list refreshed: "
+                    f"{len(models)} model(s) found.")
+            elif error:
+                self.append_to_terminal(
+                    "warn", f"Could not list models from "
+                    f"{self.model_mgr.endpoint}: {error}")
         self.after(0, _upd)
 
     def _refresh_models_ui(self):
-        self.append_to_terminal("info", "Querying available models…")
+        self.append_to_terminal(
+            "info", f"Querying {self.model_mgr.provider_type} at "
+            f"{self.model_mgr.endpoint}…")
         self.model_mgr.refresh(callback=self._on_models_refreshed)
+
+    def open_provider_settings(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Model Provider")
+        win.geometry("640x700")
+        win.minsize(580, 620)
+        win.resizable(False, False)
+        win.configure(fg_color=PALETTE["bg_panel"])
+        win.grab_set()
+
+        ctk.CTkLabel(
+            win, text="Connect a model provider",
+            font=ctk.CTkFont(size=FONT_SCALE["h1"], weight="bold"),
+            text_color=PALETTE["text_hi"]).pack(anchor="w", padx=24, pady=(20, 4))
+        ctk.CTkLabel(
+            win,
+            text="Use Ollama or any OpenAI-compatible local/remote endpoint. "
+                 "Models are loaded from the endpoint you configure.",
+            wraplength=560, justify="left",
+            font=ctk.CTkFont(size=FONT_SCALE["body"]),
+            text_color=PALETTE["text_mid"]).pack(anchor="w", padx=24, pady=(0, 14))
+
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill="x", padx=24)
+        body.grid_columnconfigure(0, weight=1)
+        is_local_ollama = (self.model_mgr.provider_type == "ollama" and
+                           "localhost" in self.model_mgr.endpoint or
+                           self.model_mgr.provider_type == "ollama" and
+                           "127.0.0.1" in self.model_mgr.endpoint)
+        provider_var = ctk.StringVar(value=(
+            "OpenAI-compatible" if self.model_mgr.provider_type != "ollama"
+            else "Local Ollama" if is_local_ollama else "Remote Ollama"))
+        endpoint_var = ctk.StringVar(value=self.model_mgr.endpoint)
+        ctk.CTkLabel(body, text="Provider",
+                     text_color=PALETTE["text_mid"]).grid(
+                         row=0, column=0, sticky="w", pady=(2, 3))
+        provider_combo = ctk.CTkComboBox(
+            body, variable=provider_var,
+            values=["Local Ollama", "Remote Ollama", "OpenAI-compatible"],
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            button_color=PALETTE["accent"], text_color=PALETTE["text_hi"],
+            dropdown_fg_color=PALETTE["bg_card"],
+            dropdown_text_color=PALETTE["text_hi"]
+        )
+        provider_combo.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+
+        def provider_changed(selection):
+            if selection == "Local Ollama":
+                endpoint_var.set("http://localhost:11434")
+            elif selection == "Remote Ollama":
+                endpoint_var.set("https://your-ollama-server:11434")
+            elif selection == "OpenAI-compatible":
+                endpoint_var.set("http://localhost:1234/v1")
+
+        provider_combo.configure(command=provider_changed)
+
+        ctk.CTkLabel(body, text="Base URL / endpoint",
+                     text_color=PALETTE["text_mid"]).grid(
+                         row=2, column=0, sticky="w", pady=(2, 3))
+        ctk.CTkEntry(
+            body, textvariable=endpoint_var,
+            placeholder_text="Ollama: http://localhost:11434 | OpenAI API: http://localhost:1234/v1",
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"]
+        ).grid(row=3, column=0, sticky="ew", pady=(0, 10))
+
+        ctk.CTkLabel(body, text="API key (optional for local providers)",
+                     text_color=PALETTE["text_mid"]).grid(
+                         row=4, column=0, sticky="w", pady=(2, 3))
+        key_entry = ctk.CTkEntry(
+            body, show="•", placeholder_text="Leave blank to keep the saved key",
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"])
+        key_entry.grid(row=5, column=0, sticky="ew", pady=(0, 5))
+        key_status = ctk.CTkLabel(
+            body,
+            text=("A key is stored in the system credential vault for this endpoint."
+                  if self.model_mgr._api_key else
+                  "No saved key for the currently selected endpoint."),
+            text_color=PALETTE["text_lo"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1))
+        key_status.grid(row=6, column=0, sticky="w", pady=(0, 8))
+        clear_key_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            body, text="Forget saved API key for this endpoint",
+            variable=clear_key_var, fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hot"],
+            text_color=PALETTE["text_mid"]
+        ).grid(row=7, column=0, sticky="w", pady=(0, 10))
+
+        models_panel = ctk.CTkFrame(win, fg_color=PALETTE["bg_card"],
+                                    corner_radius=8)
+        models_panel.pack(fill="both", expand=True, padx=24, pady=(0, 8))
+        models_panel.grid_columnconfigure(0, weight=1)
+        models_heading = ctk.CTkLabel(
+            models_panel, text="Available models",
+            font=ctk.CTkFont(size=FONT_SCALE["body"], weight="bold"),
+            text_color=PALETTE["text_hi"])
+        models_heading.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
+        models_list = ctk.CTkScrollableFrame(
+            models_panel, fg_color="transparent", height=175)
+        models_list.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 6))
+        models_list.grid_columnconfigure(0, weight=1)
+
+        def render_models(models):
+            for child in models_list.winfo_children():
+                child.destroy()
+            models_heading.configure(text=f"Available models ({len(models)})")
+            if not models:
+                ctk.CTkLabel(
+                    models_list, text="Connect to an endpoint to list its models.",
+                    text_color=PALETTE["text_lo"], anchor="w"
+                ).grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+                return
+            for index, model_name in enumerate(models):
+                row = ctk.CTkFrame(models_list, fg_color=PALETTE["bg_input"],
+                                   corner_radius=5)
+                row.grid(row=index, column=0, sticky="ew", padx=4, pady=2)
+                row.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(
+                    row, text=model_name, anchor="w",
+                    font=ctk.CTkFont(size=FONT_SCALE["small"]),
+                    text_color=PALETTE["text_hi"]
+                ).grid(row=0, column=0, sticky="ew", padx=8, pady=6)
+                ctk.CTkButton(
+                    row, text="Use", width=58, height=26,
+                    command=lambda name=model_name: choose_model(name, "inference"),
+                    fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"]
+                ).grid(row=0, column=1, padx=(4, 3), pady=3)
+                ctk.CTkButton(
+                    row, text="Map", width=58, height=26,
+                    command=lambda name=model_name: choose_model(name, "map"),
+                    fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"]
+                ).grid(row=0, column=2, padx=(3, 5), pady=3)
+
+        def choose_model(model_name, purpose):
+            variable = self.model_var if purpose == "inference" else self.map_model_var
+            setting = "inference_model" if purpose == "inference" else "map_model"
+            variable.set(model_name)
+            self.db.set_setting(setting, model_name)
+            status_var.set(f"{model_name} selected for {purpose}.")
+
+        render_models(self.model_mgr.get_models())
+
+        status_var = ctk.StringVar(value="Not connected")
+        ctk.CTkLabel(win, textvariable=status_var, anchor="w", wraplength=560,
+                     text_color=PALETTE["text_mid"],
+                     font=ctk.CTkFont(size=FONT_SCALE["small"])
+                     ).pack(fill="x", padx=24, pady=(8, 12))
+
+        actions = ctk.CTkFrame(win, fg_color="transparent")
+        actions.pack(fill="x", padx=24, pady=(0, 18))
+        actions.grid_columnconfigure(0, weight=1)
+
+        def connect_and_list():
+            provider_type = ("ollama" if provider_var.get() != "OpenAI-compatible"
+                             else "openai-compatible")
+            try:
+                self.model_mgr.configure(
+                    provider_type, endpoint_var.get(),
+                    api_key=key_entry.get().strip() or None,
+                    clear_api_key=clear_key_var.get())
+            except Exception as exc:
+                status_var.set(f"Configuration error: {exc}")
+                return
+            key_entry.delete(0, "end")
+            key_status.configure(
+                text=("A key is stored in the system credential vault for this endpoint."
+                      if self.model_mgr._api_key else
+                      "No API key stored; this is suitable for local providers."))
+            status_var.set(f"Connecting to {self.model_mgr.endpoint}…")
+            connect_button.configure(state="disabled")
+
+            def listed(models, error):
+                self._on_models_refreshed(models, error)
+                def update():
+                    if not win.winfo_exists():
+                        return
+                    connect_button.configure(state="normal")
+                    if error:
+                        status_var.set(f"Connection failed: {error}")
+                    else:
+                        render_models(models)
+                        status_var.set(
+                            f"Connected. {len(models)} model(s) found; "
+                            "choose a model in the left panel.")
+                self.after(0, update)
+
+            self.model_mgr.refresh(callback=listed)
+
+        connect_button = ctk.CTkButton(
+            actions, text="Connect & List Models", command=connect_and_list,
+            fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"],
+            font=ctk.CTkFont(size=FONT_SCALE["body"], weight="bold"),
+            height=38)
+        connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(
+            actions, text="Close", command=win.destroy,
+            fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"], height=38, width=90
+        ).grid(row=0, column=1)
 
     def _set_setup_status(self, window, variable, message):
         def update():
@@ -1423,7 +2062,8 @@ class AgenticStudioApp(ctk.CTk):
     def open_ollama_setup(self):
         win = ctk.CTkToplevel(self)
         win.title("Ollama Setup")
-        win.geometry("560x500")
+        win.geometry("640x720")
+        win.minsize(580, 620)
         win.resizable(False, False)
         win.configure(fg_color=PALETTE["bg_panel"])
         win.grab_set()
@@ -1433,25 +2073,38 @@ class AgenticStudioApp(ctk.CTk):
                      text_color=PALETTE["text_hi"]).pack(pady=(22, 8))
         ctk.CTkLabel(
             win,
-            text="Use local models for on-device inference, or sign in to Ollama\n"
-                 "to enable its cloud models. Agentic Studio does not store credentials.",
-            justify="center", wraplength=500,
+            text="Connect to a local or remote Ollama server. For authenticated "
+                 "remote servers, save the API key in Provider settings first.",
+            justify="left", wraplength=570,
             font=ctk.CTkFont(size=FONT_SCALE["body"]),
-            text_color=PALETTE["text_mid"]).pack(padx=24, pady=(0, 14))
+            text_color=PALETTE["text_mid"]).pack(anchor="w", padx=24, pady=(0, 10))
 
-        status_var = ctk.StringVar(value="Checking Ollama at http://localhost:11434…")
+        endpoint_var = ctk.StringVar(value=(
+            self.model_mgr.endpoint if self.model_mgr.provider_type == "ollama"
+            else "http://localhost:11434"))
+        ctk.CTkLabel(win, text="Ollama endpoint",
+                     text_color=PALETTE["text_mid"]).pack(anchor="w", padx=28)
+        endpoint_entry = ctk.CTkEntry(
+            win, textvariable=endpoint_var,
+            placeholder_text="http://localhost:11434 or https://your-server:11434",
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"])
+        endpoint_entry.pack(fill="x", padx=24, pady=(3, 8))
+
+        status_var = ctk.StringVar(value="Enter an endpoint and list its models.")
         ctk.CTkLabel(win, textvariable=status_var, anchor="w", justify="left",
-                     wraplength=500, text_color=PALETTE["text_hi"],
+                     wraplength=570, text_color=PALETTE["text_hi"],
                      font=ctk.CTkFont(size=FONT_SCALE["small"])
-                     ).pack(fill="x", padx=28, pady=(4, 10))
+                     ).pack(fill="x", padx=28, pady=(4, 6))
 
         action_row = ctk.CTkFrame(win, fg_color="transparent")
-        action_row.pack(fill="x", padx=24, pady=4)
+        action_row.pack(fill="x", padx=24, pady=(0, 8))
         action_row.grid_columnconfigure(0, weight=1)
         action_row.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
             action_row, text="Check & Refresh Models",
-            command=lambda: self._check_ollama_connection(win, status_var),
+            command=lambda: self._check_ollama_connection(
+                win, status_var, endpoint_entry, render_ollama_models),
             fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"]
         ).grid(row=0, column=0, sticky="ew", padx=(0, 5))
         ctk.CTkButton(
@@ -1460,9 +2113,57 @@ class AgenticStudioApp(ctk.CTk):
             fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"]
         ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
+        models_panel = ctk.CTkFrame(win, fg_color=PALETTE["bg_card"],
+                                    corner_radius=8)
+        models_panel.pack(fill="both", expand=True, padx=24, pady=(0, 8))
+        models_panel.grid_columnconfigure(0, weight=1)
+        models_heading = ctk.CTkLabel(
+            models_panel, text="Available models",
+            font=ctk.CTkFont(size=FONT_SCALE["body"], weight="bold"),
+            text_color=PALETTE["text_hi"])
+        models_heading.grid(row=0, column=0, sticky="w", padx=10, pady=(7, 3))
+        models_list = ctk.CTkScrollableFrame(
+            models_panel, fg_color="transparent", height=160)
+        models_list.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 5))
+        models_list.grid_columnconfigure(0, weight=1)
+
+        def render_ollama_models(models):
+            for child in models_list.winfo_children():
+                child.destroy()
+            models_heading.configure(text=f"Available models ({len(models)})")
+            if not models:
+                ctk.CTkLabel(
+                    models_list, text="No models returned by this endpoint.",
+                    text_color=PALETTE["text_lo"], anchor="w"
+                ).grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+                return
+            for index, model_name in enumerate(models):
+                row = ctk.CTkFrame(models_list, fg_color=PALETTE["bg_input"],
+                                   corner_radius=5)
+                row.grid(row=index, column=0, sticky="ew", padx=4, pady=2)
+                row.grid_columnconfigure(0, weight=1)
+                ctk.CTkLabel(
+                    row, text=model_name, anchor="w",
+                    font=ctk.CTkFont(size=FONT_SCALE["small"]),
+                    text_color=PALETTE["text_hi"]
+                ).grid(row=0, column=0, sticky="ew", padx=8, pady=5)
+                ctk.CTkButton(
+                    row, text="Use", width=58, height=25,
+                    command=lambda name=model_name: self._select_model(name, "inference"),
+                    fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"]
+                ).grid(row=0, column=1, padx=(4, 3), pady=3)
+                ctk.CTkButton(
+                    row, text="Map", width=58, height=25,
+                    command=lambda name=model_name: self._select_model(name, "map"),
+                    fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"]
+                ).grid(row=0, column=2, padx=(3, 5), pady=3)
+
+        render_ollama_models(self.model_mgr.get_models()
+                             if self.model_mgr.provider_type == "ollama" else [])
+
         ctk.CTkLabel(win, text="Pull a local model",
                      font=ctk.CTkFont(size=FONT_SCALE["body"], weight="bold"),
-                     text_color=PALETTE["text_hi"]).pack(anchor="w", padx=28, pady=(22, 5))
+                     text_color=PALETTE["text_hi"]).pack(anchor="w", padx=28, pady=(4, 5))
         pull_row = ctk.CTkFrame(win, fg_color="transparent")
         pull_row.pack(fill="x", padx=24)
         model_entry = ctk.CTkEntry(
@@ -1474,7 +2175,8 @@ class AgenticStudioApp(ctk.CTk):
         pull_button = ctk.CTkButton(
             pull_row, text="Pull", width=74,
             command=lambda: self._pull_ollama_model(
-                win, model_entry.get(), pull_status, pull_button),
+                win, model_entry.get(), endpoint_entry, pull_status,
+                pull_button, render_ollama_models),
             fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"])
         pull_button.pack(side="right")
         ctk.CTkLabel(win, textvariable=pull_status, anchor="w", justify="left",
@@ -1499,32 +2201,44 @@ class AgenticStudioApp(ctk.CTk):
                       text_color=PALETTE["text_hi"], width=100
                       ).pack(side="right")
 
-        self._check_ollama_connection(win, status_var)
+        self._check_ollama_connection(
+            win, status_var, endpoint_entry, render_ollama_models)
 
-    def _check_ollama_connection(self, window, status_var):
-        self._set_setup_status(window, status_var, "Checking local Ollama…")
+    def _select_model(self, model_name, purpose):
+        variable = self.model_var if purpose == "inference" else self.map_model_var
+        setting = "inference_model" if purpose == "inference" else "map_model"
+        variable.set(model_name)
+        self.db.set_setting(setting, model_name)
+        self.set_status(f"{model_name} selected for {purpose}", "idle")
 
-        def check():
-            try:
-                if ollama is None:
-                    raise RuntimeError("The Python package 'ollama' is not installed.")
-                result = ollama.list()
-                models = result.get("models", [])
-                cloud_count = sum(
-                    "cloud" in model.get("name", "").lower()
-                    for model in models)
-                message = f"Connected. {len(models)} model(s) available."
-                if not cloud_count:
-                    message += " Sign in to Ollama to enable cloud models."
-                self._set_setup_status(window, status_var, message)
-                self.after(0, lambda: self.model_mgr.refresh(
-                    callback=self._on_models_refreshed))
-            except Exception as exc:
-                self._set_setup_status(
-                    window, status_var,
-                    f"Could not connect to local Ollama: {exc}")
+    def _check_ollama_connection(self, window, status_var, endpoint_entry,
+                                 render_models):
+        try:
+            self.model_mgr.configure("ollama", endpoint_entry.get())
+        except Exception as exc:
+            status_var.set(f"Invalid Ollama endpoint: {exc}")
+            return
+        self._set_setup_status(
+            window, status_var, f"Checking {self.model_mgr.endpoint}…")
 
-        threading.Thread(target=check, daemon=True).start()
+        def listed(models, error):
+            self._on_models_refreshed(models, error)
+            def update():
+                if not window.winfo_exists():
+                    return
+                render_models(models)
+                if error:
+                    status_var.set(
+                        f"Could not connect to {self.model_mgr.endpoint}: {error}. "
+                        "For authenticated remote servers, set the API key in Provider settings.")
+                else:
+                    cloud_count = sum("cloud" in name.lower() for name in models)
+                    status_var.set(
+                        f"Connected to {self.model_mgr.endpoint}. "
+                        f"{len(models)} model(s) available; {cloud_count} cloud model(s).")
+            self.after(0, update)
+
+        self.model_mgr.refresh(callback=listed)
 
     def _start_ollama_sign_in(self, window, status_var):
         executable = shutil.which("ollama")
@@ -1547,15 +2261,16 @@ class AgenticStudioApp(ctk.CTk):
             self._set_setup_status(
                 window, status_var, f"Could not start Ollama: {exc}")
 
-    def _pull_ollama_model(self, window, model_name, status_var, button):
+    def _pull_ollama_model(self, window, model_name, endpoint_entry,
+                           status_var, button, render_models):
         model_name = model_name.strip()
         if not model_name:
             self._set_setup_status(window, status_var, "Enter a model name to pull.")
             return
-        if ollama is None:
-            self._set_setup_status(
-                window, status_var,
-                "The Ollama Python package is missing. Install it with: python -m pip install ollama")
+        try:
+            self.model_mgr.configure("ollama", endpoint_entry.get())
+        except Exception as exc:
+            self._set_setup_status(window, status_var, f"Invalid Ollama endpoint: {exc}")
             return
 
         button.configure(state="disabled")
@@ -1563,7 +2278,7 @@ class AgenticStudioApp(ctk.CTk):
 
         def pull():
             try:
-                for progress in ollama.pull(model_name, stream=True):
+                for progress in self.model_mgr.pull(model_name, stream=True):
                     status = getattr(progress, "status", None)
                     completed = getattr(progress, "completed", None)
                     total = getattr(progress, "total", None)
@@ -1577,8 +2292,10 @@ class AgenticStudioApp(ctk.CTk):
                     self._set_setup_status(window, status_var, message)
                 self._set_setup_status(
                     window, status_var, f"{model_name} is ready.")
-                self.after(0, lambda: self.model_mgr.refresh(
-                    callback=self._on_models_refreshed))
+                def refreshed(models, error):
+                    self._on_models_refreshed(models, error)
+                    self.after(0, lambda: render_models(models))
+                self.model_mgr.refresh(callback=refreshed)
             except Exception as exc:
                 self._set_setup_status(
                     window, status_var, f"Model pull failed: {exc}")
@@ -1591,34 +2308,603 @@ class AgenticStudioApp(ctk.CTk):
     # --------------------------------------------------------
     # WORKSPACE INTERACTIVITY (7F)
     # --------------------------------------------------------
-    def _listen_to_mic(self, input_widget):
+    def _listen_to_mic(self, input_widget, button=None):
         if sr is None:
-            messagebox.showerror("Error", "SpeechRecognition module is not installed.")
+            messagebox.showerror("Voice Input", "SpeechRecognition is not installed.")
             return
-            
+
+        if self._voice_busy:
+            return
+        restart_wake = (self.voice_wake_enabled and self._wake_thread is not None
+                        and self._wake_thread.is_alive())
+        wake_thread = self._wake_thread
+        if restart_wake:
+            self._wake_stop_event.set()
+        self._voice_busy = True
+        if button:
+            button.configure(state="disabled", text="…")
+        self.set_status("Preparing microphone…", "busy")
+
         def _do_listen():
             recognizer = sr.Recognizer()
-            with sr.Microphone() as source:
-                self.after(0, lambda: self.set_status("Listening... Speak now.", "busy"))
-                try:
-                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
-                    text = recognizer.recognize_google(audio)
-                    self.after(0, lambda: _insert_text(text))
-                except sr.UnknownValueError:
-                    self.after(0, lambda: self.set_status("Could not understand audio", "error"))
-                except sr.RequestError:
-                    self.after(0, lambda: self.set_status("Could not request results", "error"))
-                except Exception as e:
-                    self.after(0, lambda: self.set_status(f"Microphone Error: {e}", "error"))
-                finally:
-                    self.after(2000, lambda: self.set_status("Idle", "idle"))
-                    
-        def _insert_text(text):
-            current = input_widget.get()
-            input_widget.delete(0, "end")
-            input_widget.insert(0, current + (" " if current else "") + text)
-            
+            status = "Idle"
+            level = "idle"
+            try:
+                if restart_wake and wake_thread is not threading.current_thread():
+                    wake_thread.join(timeout=2)
+                with sr.Microphone() as source:
+                    self.after(0, lambda: self.set_status(
+                        "Calibrating microphone…", "busy"))
+                    recognizer.adjust_for_ambient_noise(source, duration=0.4)
+                    self.after(0, lambda: self.set_status(
+                        "Listening… speak now", "busy"))
+                    audio = recognizer.listen(
+                        source, timeout=5, phrase_time_limit=20)
+                text = recognizer.recognize_google(
+                    audio, language=self.voice_language)
+                self.after(0, lambda: self._insert_voice_text(input_widget, text))
+                status = "Voice input ready"
+            except sr.WaitTimeoutError:
+                status, level = "No speech detected", "error"
+            except sr.UnknownValueError:
+                status, level = "Could not understand audio", "error"
+            except sr.RequestError as exc:
+                status, level = f"Speech service unavailable: {exc}", "error"
+            except OSError as exc:
+                status, level = f"Microphone unavailable: {exc}", "error"
+            except Exception as exc:
+                status, level = f"Voice input failed: {exc}", "error"
+            finally:
+                self._voice_busy = False
+                self.after(0, lambda: self._finish_voice_input(
+                    button, status, level, restart_wake))
+
         threading.Thread(target=_do_listen, daemon=True).start()
+
+    def _insert_voice_text(self, input_widget, text):
+        try:
+            if isinstance(input_widget, ctk.CTkTextbox):
+                current = input_widget.get("1.0", "end-1c").strip()
+                input_widget.delete("1.0", "end")
+                input_widget.insert("end", current + ("\n" if current else "") + text)
+            else:
+                current = input_widget.get()
+                input_widget.delete(0, "end")
+                input_widget.insert(0, current + (" " if current else "") + text)
+            input_widget.focus_set()
+        except tk.TclError:
+            pass
+
+    def _finish_voice_input(self, button, status, level, restart_wake=False):
+        if button and button.winfo_exists():
+            button.configure(state="normal", text="🎤")
+        self.set_status(status, level)
+        if restart_wake and self.voice_wake_enabled:
+            self._start_wake_listener()
+
+    def _update_wake_button(self):
+        if not hasattr(self, "_voice_toggle_btn"):
+            return
+        active = self.voice_wake_enabled
+        self._voice_toggle_btn.configure(
+            text=f"◉ Wake {'ON' if active else 'OFF'}",
+            bg=PALETTE["accent_glow"] if active else PALETTE["bg_card"],
+            fg=PALETTE["text_hi"] if active else PALETTE["text_mid"],
+            activebackground=PALETTE["accent"],
+            activeforeground="#ffffff",
+            cursor="hand2")
+
+    def _toggle_wake_listener(self):
+        self.voice_wake_enabled = not self.voice_wake_enabled
+        self.db.set_setting("voice_wake_enabled", "1" if self.voice_wake_enabled else "0")
+        self._update_wake_button()
+        if self.voice_wake_enabled:
+            self._start_wake_listener()
+        else:
+            self._wake_stop_event.set()
+            self.set_status("Wake phrase disabled", "idle")
+
+    def _start_wake_listener(self):
+        if not self.voice_wake_enabled or sr is None:
+            return
+        if self._voice_busy:
+            self.after(400, self._start_wake_listener)
+            return
+        if self._wake_thread and self._wake_thread.is_alive():
+            if self._wake_stop_event.is_set():
+                self.after(250, self._start_wake_listener)
+            return
+        self._wake_stop_event.clear()
+        phrase = self.voice_wake_phrase.strip() or "Ok Chacha"
+        self._wake_thread = threading.Thread(
+            target=self._wake_listener_loop, args=(phrase,), daemon=True)
+        self._wake_thread.start()
+        self.set_status(f"Listening for '{phrase}'", "idle")
+        self._update_wake_button()
+
+    def _wake_listener_loop(self, phrase):
+        recognizer = sr.Recognizer()
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.35)
+                while not self._wake_stop_event.is_set():
+                    try:
+                        audio = recognizer.listen(
+                            source, timeout=1, phrase_time_limit=6)
+                    except sr.WaitTimeoutError:
+                        continue
+                    try:
+                        heard = recognizer.recognize_google(
+                            audio, language=self.voice_language)
+                    except sr.UnknownValueError:
+                        continue
+                    except sr.RequestError as exc:
+                        self.after(0, lambda error=str(exc): self.set_status(
+                            f"Wake recognition unavailable: {error}", "error"))
+                        if self._wake_stop_event.wait(3):
+                            break
+                        continue
+
+                    match = self._match_wake_phrase(heard, phrase)
+                    if not match:
+                        continue
+                    request = heard[match.end():].strip(" ,.!?;:")
+                    self.after(0, lambda: self._on_wake_detected())
+                    if request:
+                        self.after(0, lambda value=request:
+                                   self._handle_voice_utterance(value))
+                        continue
+
+                    self.after(0, lambda: self._set_voice_panel_status(
+                        "Wake phrase heard. Listening for your request…"))
+                    try:
+                        request_audio = recognizer.listen(
+                            source, timeout=8, phrase_time_limit=20)
+                        request = recognizer.recognize_google(
+                            request_audio, language=self.voice_language).strip()
+                        if request:
+                            self.after(0, lambda value=request:
+                                       self._handle_voice_utterance(value))
+                    except sr.WaitTimeoutError:
+                        self.after(0, lambda: self._set_voice_panel_status(
+                            "Ready. Speak or type a request."))
+                    except sr.UnknownValueError:
+                        self.after(0, lambda: self._set_voice_panel_status(
+                            "I could not understand that. Try again."))
+                    except sr.RequestError as exc:
+                        self.after(0, lambda error=str(exc):
+                                   self._set_voice_panel_status(
+                                       f"Speech service unavailable: {error}"))
+                        if self._wake_stop_event.wait(3):
+                            break
+        except Exception as exc:
+            if not self._wake_stop_event.is_set():
+                self.after(0, lambda error=str(exc): self.set_status(
+                    f"Wake listener stopped: {error}", "error"))
+                if not self._wake_stop_event.wait(4):
+                    self.after(0, self._start_wake_listener)
+        finally:
+            if not self._wake_stop_event.is_set():
+                self.after(0, self._update_wake_button)
+
+    @staticmethod
+    def _match_wake_phrase(heard, phrase):
+        candidates = [phrase]
+        compact = re.sub(r"[^a-z0-9]", "", phrase.lower())
+        if compact in ("okchacha", "okaychacha"):
+            candidates.extend(["okay chacha", "ok cha cha", "okay cha cha",
+                               "chacha", "cha cha"])
+        for candidate in candidates:
+            words = re.findall(r"[a-z0-9]+", candidate.lower())
+            if not words:
+                continue
+            pattern = r"(?<!\w)" + r"[\W_]+".join(
+                re.escape(word) for word in words) + r"(?!\w)"
+            match = re.search(pattern, heard, re.IGNORECASE)
+            if match:
+                return match
+        return None
+
+    def _on_wake_detected(self):
+        self._open_voice_panel(route=self.voice_wake_target, source="wake")
+        self._set_voice_panel_status(
+            f"'{self.voice_wake_phrase}' heard. Speak or edit your request.")
+
+    def _handle_voice_utterance(self, utterance):
+        utterance = utterance.strip()
+        if not utterance:
+            return
+        self._open_voice_panel(route=self.voice_wake_target, source="wake")
+        lowered = utterance.lower().strip(" .,!?")
+
+        if re.fullmatch(r"(?:please\s+)?(?:read|speak)(?:\s+it)?\s+aloud", lowered):
+            self._read_last_response()
+            return
+        if re.fullmatch(r"(?:please\s+)?(?:stop|cancel)\s+"
+                        r"(?:speaking|reading|voice)", lowered):
+            self._stop_speech()
+            return
+        if re.fullmatch(r"(?:please\s+)?(?:cancel|clear|forget that)", lowered):
+            self._set_voice_panel_transcript("")
+            self._set_voice_panel_status("Draft cleared.")
+            return
+
+        execute_match = re.match(
+            r"^(?:please\s+)?(?:execute|run|initialize)(?:\s+(.*))?$",
+            utterance, re.IGNORECASE)
+        if execute_match:
+            request = (execute_match.group(1) or "").strip()
+            if not request and self._voice_panel_entry:
+                request = self._voice_panel_entry.get().strip()
+            if request:
+                self._route_voice_request(
+                    request, "Agent Directives", execute=True)
+            else:
+                self._set_voice_panel_status(
+                    "Say 'execute' with a request, or dictate a request first.")
+            return
+
+        route_match = re.match(
+            r"^(?:please\s+)?(?:send|put|route)\s+"
+            r"(?:(?:it|that|this|the request)\s+)?to\s+(?:the\s+)?"
+            r"(agent\s+directives?|directives?|workspace(?:\s+chat)?)"
+            r"(?:\s+(?:saying\s+)?(.+))?$",
+            utterance, re.IGNORECASE)
+        if route_match:
+            route = ("Agent Directives" if "directive" in
+                     route_match.group(1).lower() else "Workspace Chat")
+            request = (route_match.group(2) or "").strip()
+            if not request and self._voice_panel_entry:
+                request = self._voice_panel_entry.get().strip()
+            if request:
+                self._route_voice_request(request, route)
+                self._set_voice_panel_status(
+                    f"Request sent to {route}.")
+            else:
+                if self._voice_panel_route:
+                    self._voice_panel_route.set(route)
+                self._set_voice_panel_status(
+                    f"Ready. The next request will go to {route}.")
+            return
+
+        payload_route = re.match(
+            r"^(?:please\s+)?send\s+(.+?)\s+to\s+(?:the\s+)?"
+            r"(agent\s+directives?|directives?|workspace(?:\s+chat)?)$",
+            utterance, re.IGNORECASE)
+        if payload_route:
+            route = ("Agent Directives" if "directive" in
+                     payload_route.group(2).lower() else "Workspace Chat")
+            self._route_voice_request(payload_route.group(1).strip(), route)
+            self._set_voice_panel_status(f"Request sent to {route}.")
+            return
+
+        self._set_voice_panel_transcript(utterance)
+
+    def _set_voice_panel_status(self, text):
+        if self._voice_panel_status and self._voice_panel_status.winfo_exists():
+            self._voice_panel_status.configure(text=text)
+
+    def _set_voice_panel_transcript(self, text):
+        if self._voice_panel_entry and self._voice_panel_entry.winfo_exists():
+            self._voice_panel_entry.delete(0, "end")
+            self._voice_panel_entry.insert(0, text)
+            self._voice_panel_entry.focus_set()
+            self._set_voice_panel_status("Transcript ready. Review, edit, then send.")
+
+    def _open_voice_panel(self, route="Agent Directives", capture=False,
+                          source="manual"):
+        if self._voice_panel and self._voice_panel.winfo_exists():
+            self._voice_panel.lift()
+            if self._voice_panel_route:
+                self._voice_panel_route.set(route)
+            if capture:
+                self._listen_to_mic(self._voice_panel_entry,
+                                    self._voice_panel_mic_button)
+            return
+
+        panel = ctk.CTkToplevel(self)
+        self._voice_panel = panel
+        panel.title("LAYA Voice")
+        panel.geometry("470x292")
+        panel.resizable(False, False)
+        panel.configure(fg_color=PALETTE["bg_panel"])
+        panel.attributes("-topmost", True)
+        panel.grid_columnconfigure(0, weight=1)
+        panel.protocol("WM_DELETE_WINDOW", panel.destroy)
+
+        header = ctk.CTkFrame(panel, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 2))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="Voice request",
+                     font=ctk.CTkFont(size=FONT_SCALE["h2"], weight="bold"),
+                     text_color=PALETTE["text_hi"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(header, text="×", width=28, height=26,
+                      fg_color="transparent", hover_color=PALETTE["danger"],
+                      command=panel.destroy).grid(row=0, column=1, sticky="e")
+
+        self._voice_panel_status = ctk.CTkLabel(
+            panel, text="Ready. Speak or type a request.", anchor="w",
+            font=ctk.CTkFont(size=FONT_SCALE["small"]),
+            text_color=PALETTE["text_mid"])
+        self._voice_panel_status.grid(row=1, column=0, sticky="ew",
+                                      padx=18, pady=(0, 8))
+        entry_frame = ctk.CTkFrame(panel, fg_color=PALETTE["bg_input"],
+                                   corner_radius=8,
+                                   border_width=1,
+                                   border_color=PALETTE["border"])
+        entry_frame.grid(row=2, column=0, sticky="ew", padx=18, pady=2)
+        entry_frame.grid_columnconfigure(0, weight=1)
+        self._voice_panel_entry = ctk.CTkEntry(
+            entry_frame, placeholder_text="Your request…", height=38,
+            fg_color="transparent", border_width=0,
+            text_color=PALETTE["text_hi"])
+        self._voice_panel_entry.grid(row=0, column=0, sticky="ew", padx=8, pady=3)
+        self._voice_panel_entry.bind("<Return>", lambda event: self._send_voice_request())
+
+        route_frame = ctk.CTkFrame(panel, fg_color="transparent")
+        route_frame.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 4))
+        route_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(route_frame, text="Send to",
+                     text_color=PALETTE["text_mid"],
+                     font=ctk.CTkFont(size=FONT_SCALE["small"])
+                     ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self._voice_panel_route = ctk.StringVar(value=route)
+        ctk.CTkSegmentedButton(
+            route_frame, values=["Agent Directives", "Workspace Chat"],
+            variable=self._voice_panel_route,
+            selected_color=PALETTE["accent"],
+            selected_hover_color=PALETTE["accent_hot"],
+            unselected_color=PALETTE["bg_card"],
+            unselected_hover_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"]
+        ).grid(row=0, column=1, sticky="ew")
+
+        actions = ctk.CTkFrame(panel, fg_color="transparent")
+        actions.grid(row=4, column=0, sticky="ew", padx=18, pady=(6, 4))
+        for column in range(3):
+            actions.grid_columnconfigure(column, weight=1)
+        self._voice_panel_mic_button = ctk.CTkButton(
+            actions, text="🎤 Listen", width=96, height=34,
+            fg_color=PALETTE["bg_card"], hover_color=PALETTE["border"],
+            command=lambda: self._listen_to_mic(
+                self._voice_panel_entry, self._voice_panel_mic_button))
+        self._voice_panel_mic_button.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            actions, text="Execute", width=92, height=34,
+            fg_color=PALETTE["accent_glow"], hover_color=PALETTE["accent"],
+            command=self._execute_voice_request
+        ).grid(row=0, column=1, padx=3)
+        ctk.CTkButton(
+            actions, text="Send", width=92, height=34,
+            fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hot"],
+            command=self._send_voice_request
+        ).grid(row=0, column=2, sticky="e")
+        self._voice_panel_speech_button = ctk.CTkButton(
+            panel, text="Read last response aloud", height=30,
+            fg_color="transparent", hover_color=PALETTE["border"],
+            text_color=PALETTE["text_mid"],
+            command=self._read_last_response
+        )
+        self._voice_panel_speech_button.grid(
+            row=5, column=0, sticky="e", padx=18, pady=(0, 8))
+        panel.bind("<Destroy>", lambda event: self._clear_voice_panel(event, panel))
+        panel.lift()
+        self._voice_panel_entry.focus_set()
+        if capture:
+            panel.after(150, lambda: self._listen_to_mic(
+                self._voice_panel_entry, self._voice_panel_mic_button))
+
+    def _clear_voice_panel(self, event, panel):
+        if event.widget is panel:
+            self._voice_panel = None
+            self._voice_panel_entry = None
+            self._voice_panel_status = None
+            self._voice_panel_route = None
+            self._voice_panel_mic_button = None
+            self._voice_panel_speech_button = None
+
+    def _send_voice_request(self):
+        if not self._voice_panel_entry or not self._voice_panel_entry.winfo_exists():
+            return
+        request = self._voice_panel_entry.get().strip()
+        if not request:
+            self._set_voice_panel_status("Say or type a request first.")
+            return
+        route = self._voice_panel_route.get()
+        panel = self._voice_panel
+        if panel and panel.winfo_exists():
+            panel.destroy()
+        self._route_voice_request(request, route)
+
+    def _execute_voice_request(self):
+        if not self._voice_panel_entry or not self._voice_panel_entry.winfo_exists():
+            return
+        request = self._voice_panel_entry.get().strip()
+        if not request:
+            self._set_voice_panel_status("Say or type an instruction to execute.")
+            return
+        panel = self._voice_panel
+        if panel and panel.winfo_exists():
+            panel.destroy()
+        self._route_voice_request(request, "Agent Directives", execute=True)
+
+    def _read_last_response(self):
+        if self._last_agent_response:
+            self._speak_text(self._last_agent_response)
+        else:
+            self._set_voice_panel_status("There is no response to read aloud yet.")
+
+    def _route_voice_request(self, request, route, execute=False):
+        if route == "Agent Directives":
+            self.prompt_text.delete("1.0", "end")
+            self.prompt_text.insert("1.0", request)
+            self.prompt_text.focus_set()
+            self.right_tabs.set("  💬 Workspace  ")
+            self.set_status("Voice request placed in Agent Directives", "idle")
+            if execute or self.voice_auto_run_directives:
+                self.start_pipeline()
+            return
+        self.right_tabs.set("  💬 Workspace  ")
+        self.chat_input.delete(0, "end")
+        self.chat_input.insert(0, request)
+        self.chat_input.focus_set()
+        self.send_followup()
+
+    def _on_close(self):
+        self.voice_wake_enabled = False
+        self._wake_stop_event.set()
+        self._stop_speech()
+        self.destroy()
+
+    @staticmethod
+    def _prepare_speech_text(text):
+        speech = html.unescape(text)
+        speech = re.sub(r"```.*?```", " Code block omitted. ", speech,
+                        flags=re.DOTALL)
+        speech = re.sub(r"`([^`]+)`", r"\1", speech)
+        speech = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", speech)
+        speech = re.sub(r"https?://\S+|www\.\S+", "link omitted", speech)
+        speech = re.sub(r"<br\s*/?>", "\n", speech, flags=re.IGNORECASE)
+        speech = re.sub(r"</?(?:p|div|li|h[1-6])\b[^>]*>", "\n", speech,
+                        flags=re.IGNORECASE)
+        speech = re.sub(r"<[^>]+>", " ", speech)
+
+        spoken_lines = []
+        table_headers = None
+        for raw_line in speech.splitlines():
+            line = raw_line.strip()
+            if not line:
+                table_headers = None
+                continue
+            if "|" in line:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if cells and all(re.fullmatch(r"[:\-\s]+", cell) for cell in cells):
+                    continue
+                if table_headers is None:
+                    table_headers = cells
+                    continue
+                details = [
+                    f"{table_headers[index] if index < len(table_headers) else 'Value'}: {cell}"
+                    for index, cell in enumerate(cells) if cell]
+                if details:
+                    spoken_lines.append(". ".join(details))
+                continue
+
+            table_headers = None
+            line = re.sub(r"^\s*#{1,6}\s*", "", line)
+            line = re.sub(r"^\s*>\s*", "", line)
+            line = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line)
+            line = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", r"\1\2", line)
+            line = re.sub(r"\*(.+?)\*|_(.+?)_", r"\1\2", line)
+            line = re.sub(r"~~(.+?)~~", r"\1", line)
+            line = line.replace("—", ", ").replace("–", ", ")
+            line = line.replace("…", ". ").replace("→", " leads to ")
+            line = line.replace("|", ", ").replace(";", ", ")
+            line = re.sub(r"[\U0001F000-\U0001FAFF]", "", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                spoken_lines.append(line)
+
+        speech = ". ".join(spoken_lines)
+        speech = re.sub(r"(?:\.\s*){2,}", ". ", speech)
+        speech = re.sub(r"[,;:]\s*\.", ".", speech)
+        speech = re.sub(r"\s+([,.;:!?])", r"\1", speech)
+        speech = re.sub(r"([,;:])(?=\S)", r"\1 ", speech)
+        return speech.strip()
+
+    def _set_speech_controls(self, active, generation=None):
+        if (generation is not None and
+                generation != self._speech_generation):
+            return
+        self._speech_active = active
+        if hasattr(self, "_speech_stop_btn") and self._speech_stop_btn.winfo_exists():
+            self._speech_stop_btn.configure(
+                state="normal" if active else "disabled")
+        button = self._voice_panel_speech_button
+        if button and button.winfo_exists():
+            button.configure(
+                text="Stop speaking" if active else "Read last response aloud",
+                command=self._stop_speech if active else self._read_last_response)
+
+    def _stop_speech(self):
+        with self._speech_lock:
+            if not self._speech_active:
+                return
+            self._speech_stop_event.set()
+            self._speech_generation += 1
+            generation = self._speech_generation
+            self._speech_engine = None
+        self._speech_active = False
+        self._set_speech_controls(False, generation)
+        self.set_status("Speech stopped", "idle")
+
+    def _speak_text(self, text):
+        if pyttsx3 is None:
+            self.set_status("Text-to-speech is not installed", "error")
+            return
+        speech = self._prepare_speech_text(text)
+        if not speech:
+            return
+
+        with self._speech_lock:
+            self._speech_stop_event.set()
+            self._speech_generation += 1
+            generation = self._speech_generation
+            stop_event = threading.Event()
+            self._speech_stop_event = stop_event
+            self._speech_active = True
+            self._speech_engine = None
+        self.after(0, lambda: self._set_speech_controls(True, generation))
+
+        def speak():
+            engine = None
+            loop_started = False
+            try:
+                engine = pyttsx3.init()
+                voices = engine.getProperty("voices") or []
+                preferred_gender = self.voice_gender.lower()
+                preferred_voice = next((
+                    voice for voice in voices
+                    if preferred_gender in str(getattr(voice, "gender", "")).lower()
+                    or preferred_gender in str(getattr(voice, "name", "")).lower()),
+                    None)
+                if preferred_voice is not None:
+                    engine.setProperty("voice", preferred_voice.id)
+                engine.setProperty("rate", max(110, min(220, self.voice_rate)))
+                engine.setProperty("volume", 0.95)
+                with self._speech_lock:
+                    if generation != self._speech_generation or stop_event.is_set():
+                        return
+                    self._speech_engine = engine
+                engine.say(speech)
+                engine.startLoop(False)
+                loop_started = True
+                self.after(0, lambda: self.set_status("Speaking…", "busy"))
+                while not stop_event.is_set() and engine.isBusy():
+                    engine.iterate()
+                    stop_event.wait(0.015)
+            except Exception as exc:
+                error_message = f"Text-to-speech failed: {exc}"
+                self.after(0, lambda: self.set_status(
+                    error_message, "error"))
+            finally:
+                if engine is not None and loop_started:
+                    try:
+                        if stop_event.is_set():
+                            engine.stop()
+                        engine.endLoop()
+                    except Exception:
+                        pass
+                with self._speech_lock:
+                    if generation == self._speech_generation:
+                        self._speech_engine = None
+                        self._speech_active = False
+                        self.after(0, lambda: self._set_speech_controls(
+                            False, generation))
+                        self.after(0, lambda: self.set_status("Idle", "idle")
+                                   if not stop_event.is_set() else None)
+
+        threading.Thread(target=speak, daemon=True).start()
 
     def _search_history_ui(self):
         win = ctk.CTkToplevel(self)
@@ -1667,30 +2953,124 @@ class AgenticStudioApp(ctk.CTk):
 
     def _setup_scroll_bindings(self):
         """Bind mouse wheel scrolling for workspace and general chat panels."""
-        # Remove default CTkScrollableFrame canvas bindings to avoid double-scroll
-        for sf in (self.chat_scroll, self.general_scroll):
+        scroll_frames = (self.chat_scroll, self.general_scroll)
+        for sf in scroll_frames:
             try:
                 sf._parent_canvas.unbind("<MouseWheel>")
                 sf.unbind("<MouseWheel>")
             except Exception:
                 pass
 
+        def _scroll_target(widget):
+            while widget is not None:
+                for scroll_frame in scroll_frames:
+                    if widget in (scroll_frame, scroll_frame._parent_canvas,
+                                  scroll_frame._parent_frame):
+                        return scroll_frame._parent_canvas
+                widget = getattr(widget, "master", None)
+            return None
+
+        def _scroll_by(event, units):
+            canvas = _scroll_target(event.widget)
+            if canvas is None:
+                return
+            canvas.yview_scroll(units, "units")
+            return "break"
+
         def _on_mousewheel(event):
+            delta = getattr(event, "delta", 0)
+            units = int(-delta / 120)
+            if units == 0 and delta:
+                units = -1 if delta > 0 else 1
+            return _scroll_by(event, units) if units else None
+
+        self.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+        self.bind_all("<Button-4>", lambda e: _scroll_by(e, -1), add="+")
+        self.bind_all("<Button-5>", lambda e: _scroll_by(e, 1), add="+")
+
+    def _show_text_context_menu(self, event):
+        widget = event.widget
+        if widget.winfo_class() not in ("Entry", "Text"):
+            return
+        editable = widget.cget("state") not in ("disabled", "readonly")
+        menu = tk.Menu(self, tearoff=0, bg=PALETTE["bg_card"],
+                       fg=PALETTE["text_hi"],
+                       activebackground=PALETTE["accent"],
+                       activeforeground="#ffffff", bd=0, relief="flat")
+
+        def copy_selection():
             try:
-                w = event.widget
-                while w is not None:
-                    if w is self.chat_scroll._parent_canvas:
-                        self.chat_scroll._parent_canvas.yview_scroll(
-                            int(-1 * (event.delta / 120)), "units")
-                        return "break"
-                    if w is self.general_scroll._parent_canvas:
-                        self.general_scroll._parent_canvas.yview_scroll(
-                            int(-1 * (event.delta / 120)), "units")
-                        return "break"
-                    w = w.master
-            except Exception:
-                pass
-        self.bind_all("<MouseWheel>", _on_mousewheel)
+                if widget.winfo_class() == "Text":
+                    value = widget.get("sel.first", "sel.last")
+                else:
+                    value = widget.get()[widget.index("sel.first"):
+                                          widget.index("sel.last")]
+            except tk.TclError:
+                return
+            self.clipboard_clear()
+            self.clipboard_append(value)
+
+        def cut_selection():
+            try:
+                copy_selection()
+                if widget.winfo_class() == "Text":
+                    widget.delete("sel.first", "sel.last")
+                else:
+                    widget.delete("sel.first", "sel.last")
+            except tk.TclError:
+                return
+
+        def select_all():
+            if widget.winfo_class() == "Text":
+                widget.tag_add("sel", "1.0", "end-1c")
+            else:
+                widget.selection_range(0, "end")
+            widget.icursor("end")
+            widget.focus_set()
+
+        def paste():
+            try:
+                value = self.clipboard_get()
+                if widget.winfo_class() == "Text":
+                    if widget.tag_ranges("sel"):
+                        widget.delete("sel.first", "sel.last")
+                    widget.insert("insert", value)
+                else:
+                    if widget.selection_present():
+                        widget.delete("sel.first", "sel.last")
+                    widget.insert("insert", value)
+            except tk.TclError:
+                return
+
+        def copy_all():
+            value = (widget.get("1.0", "end-1c")
+                     if widget.winfo_class() == "Text" else widget.get())
+            self.clipboard_clear()
+            self.clipboard_append(value)
+
+        def clear_widget():
+            widget.delete("1.0" if widget.winfo_class() == "Text" else 0,
+                          "end")
+
+        menu.add_command(label="Cut", state="normal" if editable else "disabled",
+                         command=cut_selection)
+        menu.add_command(label="Copy Selection", command=copy_selection)
+        menu.add_command(label="Paste", state="normal" if editable else "disabled",
+                         command=paste)
+        menu.add_separator()
+        menu.add_command(label="Copy All", command=copy_all)
+        menu.add_command(label="Select All", command=select_all)
+        menu.add_command(label="Clear", state="normal" if editable else "disabled",
+                         command=clear_widget)
+        if widget.winfo_class() == "Text" and editable:
+            menu.add_separator()
+            menu.add_command(label="Undo", command=lambda: widget.edit_undo())
+            menu.add_command(label="Redo", command=lambda: widget.edit_redo())
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _update_msg_count(self):
         self._msg_count += 1
@@ -1703,67 +3083,190 @@ class AgenticStudioApp(ctk.CTk):
     def open_settings(self):
         win = ctk.CTkToplevel(self)
         win.title("Preferences")
-        win.geometry("520x460")
+        win.geometry("600x760")
+        win.minsize(520, 600)
         win.configure(fg_color=PALETTE["bg_panel"])
         win.grab_set()
 
         ctk.CTkLabel(win, text="Preferences",
                      font=ctk.CTkFont(size=FONT_SCALE["h1"], weight="bold"),
-                     text_color=PALETTE["text_hi"]).pack(pady=(20, 10))
+                     text_color=PALETTE["text_hi"]).pack(anchor="w", padx=24,
+                                                         pady=(16, 8))
+        body = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 4))
 
         for lbl, var in [("Inference Model", self.model_var),
                           ("Map-Reduce Model", self.map_model_var)]:
-            ctk.CTkLabel(win, text=lbl,
+            ctk.CTkLabel(body, text=lbl,
                          font=ctk.CTkFont(size=FONT_SCALE["small"]),
-                         text_color=PALETTE["text_mid"]).pack(anchor="w", padx=30, pady=(8, 2))
-            ctk.CTkEntry(win, textvariable=var, width=440,
+                         text_color=PALETTE["text_mid"]).pack(anchor="w", padx=8, pady=(8, 2))
+            ctk.CTkEntry(body, textvariable=var,
                          fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"],
                          border_color=PALETTE["border"],
-                         font=ctk.CTkFont(size=FONT_SCALE["body"])).pack(padx=30)
+                         font=ctk.CTkFont(size=FONT_SCALE["body"])).pack(fill="x", padx=8)
 
+        tesseract_var = None
         if 'pytesseract' in sys.modules:
-            ctk.CTkLabel(win, text="Tesseract Path",
+            ctk.CTkLabel(body, text="Tesseract Path",
                          font=ctk.CTkFont(size=FONT_SCALE["small"]),
-                         text_color=PALETTE["text_mid"]).pack(anchor="w", padx=30, pady=(8, 2))
-            tvar = ctk.StringVar(value=pytesseract.pytesseract.tesseract_cmd)
-            ctk.CTkEntry(win, textvariable=tvar, width=440,
+                         text_color=PALETTE["text_mid"]).pack(anchor="w", padx=8, pady=(12, 2))
+            tesseract_var = ctk.StringVar(
+                value=pytesseract.pytesseract.tesseract_cmd)
+            ctk.CTkEntry(body, textvariable=tesseract_var,
                          fg_color=PALETTE["bg_input"], text_color=PALETTE["text_hi"],
                          border_color=PALETTE["border"],
-                         font=ctk.CTkFont(size=FONT_SCALE["small"])).pack(padx=30)
+                         font=ctk.CTkFont(size=FONT_SCALE["small"])).pack(fill="x", padx=8)
 
-        ctk.CTkLabel(win, text="Theme",
+        ctk.CTkLabel(body, text="Theme",
                      font=ctk.CTkFont(size=FONT_SCALE["small"]),
-                     text_color=PALETTE["text_mid"]).pack(anchor="w", padx=30, pady=(8, 2))
+                     text_color=PALETTE["text_mid"]).pack(anchor="w", padx=8, pady=(12, 2))
         tvar2 = ctk.StringVar(value=self._active_theme)
-        ctk.CTkComboBox(win, variable=tvar2, values=list(THEMES.keys()),
+        ctk.CTkComboBox(body, variable=tvar2, values=list(THEMES.keys()),
                         fg_color=PALETTE["bg_input"],
                         border_color=PALETTE["border"],
                         button_color=PALETTE["accent"],
                         text_color=PALETTE["text_hi"],
                         dropdown_fg_color=PALETTE["bg_card"],
                         dropdown_text_color=PALETTE["text_hi"],
-                        width=440).pack(padx=30)
+                        ).pack(fill="x", padx=8)
+
+        ctk.CTkLabel(body, text="VOICE ASSISTANT",
+                     font=ctk.CTkFont(size=FONT_SCALE["small"], weight="bold"),
+                     text_color=PALETTE["accent"]).pack(anchor="w", padx=8,
+                                                        pady=(18, 4))
+        wake_enabled_var = tk.BooleanVar(value=self.voice_wake_enabled)
+        ctk.CTkCheckBox(
+            body, text="Enable always-listening wake phrase",
+            variable=wake_enabled_var, fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hot"],
+            text_color=PALETTE["text_hi"]).pack(anchor="w", padx=8, pady=5)
+
+        def add_voice_field(label, variable, values=None):
+            ctk.CTkLabel(body, text=label,
+                         font=ctk.CTkFont(size=FONT_SCALE["small"]),
+                         text_color=PALETTE["text_mid"]).pack(anchor="w", padx=8,
+                                                              pady=(8, 2))
+            if values:
+                ctk.CTkComboBox(
+                    body, variable=variable, values=values,
+                    fg_color=PALETTE["bg_input"],
+                    border_color=PALETTE["border"],
+                    button_color=PALETTE["accent"],
+                    text_color=PALETTE["text_hi"],
+                    dropdown_fg_color=PALETTE["bg_card"],
+                    dropdown_text_color=PALETTE["text_hi"]
+                ).pack(fill="x", padx=8)
+            else:
+                ctk.CTkEntry(
+                    body, textvariable=variable,
+                    fg_color=PALETTE["bg_input"],
+                    border_color=PALETTE["border"],
+                    text_color=PALETTE["text_hi"]
+                ).pack(fill="x", padx=8)
+
+        routes = ["Agent Directives", "Workspace Chat"]
+        wake_phrase_var = ctk.StringVar(value=self.voice_wake_phrase)
+        voice_language_var = ctk.StringVar(value=self.voice_language)
+        manual_route_var = ctk.StringVar(value=self.voice_manual_target)
+        wake_route_var = ctk.StringVar(value=self.voice_wake_target)
+        add_voice_field("Wake phrase", wake_phrase_var)
+        add_voice_field("Speech recognition language", voice_language_var,
+                ["en-US", "en-GB", "en-IN", "hi-IN", "fr-FR",
+                 "de-DE", "es-ES", "it-IT", "ja-JP", "zh-CN"])
+        add_voice_field("Dictate button sends to", manual_route_var, routes)
+        add_voice_field("Wake phrase sends to", wake_route_var, routes)
+
+        auto_run_var = tk.BooleanVar(value=self.voice_auto_run_directives)
+        ctk.CTkCheckBox(
+            body, text="Run analysis after sending a voice directive",
+            variable=auto_run_var, fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hot"],
+            text_color=PALETTE["text_hi"]).pack(anchor="w", padx=8, pady=(12, 4))
+        speak_replies_var = tk.BooleanVar(value=self.voice_speak_replies)
+        voice_gender_var = ctk.StringVar(value=self.voice_gender)
+        add_voice_field("Read-aloud voice", voice_gender_var,
+                ["Female", "Male"])
+        voice_rate_var = tk.DoubleVar(value=self.voice_rate)
+        rate_frame = ctk.CTkFrame(body, fg_color="transparent")
+        rate_frame.pack(fill="x", padx=8, pady=(10, 2))
+        rate_frame.grid_columnconfigure(0, weight=1)
+        rate_label = ctk.CTkLabel(
+            rate_frame, text=f"Speaking pace: {self.voice_rate}",
+            text_color=PALETTE["text_mid"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"]))
+        rate_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkSlider(
+            rate_frame, from_=120, to=210, variable=voice_rate_var,
+            command=lambda value: rate_label.configure(
+                text=f"Speaking pace: {int(float(value))}"),
+            progress_color=PALETTE["accent"],
+            button_color=PALETTE["accent_hot"],
+            button_hover_color=PALETTE["text_hi"], height=14
+        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        ctk.CTkCheckBox(
+            body, text="Read AI replies aloud",
+            variable=speak_replies_var, fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hot"],
+            text_color=PALETTE["text_hi"]).pack(anchor="w", padx=8, pady=4)
+        ctk.CTkLabel(
+            body,
+            text="Wake-word detection uses online Google speech recognition and keeps the microphone active while enabled. Audio is sent for transcription. Disable it at any time with the Wake button.",
+            wraplength=500, justify="left",
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1),
+            text_color=PALETTE["text_lo"]).pack(fill="x", padx=8, pady=(8, 16))
 
         def save():
             self.db.set_setting("inference_model", self.model_var.get())
             self.db.set_setting("map_model", self.map_model_var.get())
             self.apply_theme(tvar2.get())
-            if 'pytesseract' in sys.modules:
-                pytesseract.pytesseract.tesseract_cmd = tvar.get()
+            if tesseract_var is not None:
+                pytesseract.pytesseract.tesseract_cmd = tesseract_var.get()
+            old_phrase = self.voice_wake_phrase
+            old_enabled = self.voice_wake_enabled
+            self.voice_wake_enabled = wake_enabled_var.get()
+            self.voice_wake_phrase = wake_phrase_var.get().strip() or "Ok Chacha"
+            self.voice_language = voice_language_var.get()
+            self.voice_manual_target = manual_route_var.get()
+            self.voice_wake_target = wake_route_var.get()
+            self.voice_auto_run_directives = auto_run_var.get()
+            self.voice_speak_replies = speak_replies_var.get()
+            self.voice_gender = voice_gender_var.get()
+            self.voice_rate = int(round(voice_rate_var.get()))
+            for key, value in [
+                ("voice_wake_enabled", self.voice_wake_enabled),
+                ("voice_wake_phrase", self.voice_wake_phrase),
+                ("voice_language", self.voice_language),
+                ("voice_manual_target", self.voice_manual_target),
+                ("voice_wake_target", self.voice_wake_target),
+                ("voice_auto_run_directives", self.voice_auto_run_directives),
+                ("voice_speak_replies", self.voice_speak_replies),
+                ("voice_gender", self.voice_gender),
+                ("voice_rate", self.voice_rate)]:
+                self.db.set_setting(key, "1" if value is True else
+                                    "0" if value is False else value)
+            self._update_wake_button()
+            if old_enabled != self.voice_wake_enabled or old_phrase != self.voice_wake_phrase:
+                self._wake_stop_event.set()
+                if self.voice_wake_enabled:
+                    self.after(300, self._start_wake_listener)
+            elif not self.voice_wake_enabled:
+                self._wake_stop_event.set()
             win.destroy()
 
         ctk.CTkButton(win, text="Save & Close", command=save,
                       fg_color=PALETTE["accent"],
                       hover_color=PALETTE["accent_hot"],
                       font=ctk.CTkFont(size=FONT_SCALE["body"], weight="bold"),
-                      height=40, width=180, corner_radius=8).pack(pady=24)
+                      height=40, width=180, corner_radius=8).pack(pady=(4, 14))
 
     # --------------------------------------------------------
     # FILE OPERATIONS
     # --------------------------------------------------------
     def add_files(self):
         files = filedialog.askopenfilenames(filetypes=[
-            ("All Supported", "*.docx;*.pdf;*.xlsx;*.csv;*.txt;*.png;*.jpg;*.jpeg")])
+            ("Supported Documents and Data",
+             "*.doc;*.docx;*.pdf;*.xlsx;*.csv;*.txt;*.png;*.jpg;*.jpeg"),
+            ("All Files", "*.*")])
         for f in files:
             if f not in self.selected_files:
                 self.selected_files.append(f)
@@ -1776,7 +3279,8 @@ class AgenticStudioApp(ctk.CTk):
         if self.selected_files and not self.output_path_var.get():
             self.output_path_var.set(
                 os.path.join(os.path.dirname(self.selected_files[0]),
-                             "Agentic_Report.docx"))
+                             "Agentic_Report" +
+                             OUTPUT_FORMATS.get(self.output_format_var.get(), ".docx")))
 
     def _remove_file(self, fp, card):
         if fp in self.selected_files:
@@ -1823,15 +3327,127 @@ class AgenticStudioApp(ctk.CTk):
         threading.Thread(target=_do, daemon=True).start()
 
     def browse_output(self):
-        fn = filedialog.asksaveasfilename(defaultextension=".docx",
-                                          filetypes=[("Word Documents", "*.docx")])
+        format_name = self.output_format_var.get()
+        extension = OUTPUT_FORMATS.get(format_name, ".docx")
+        fn = filedialog.asksaveasfilename(
+            defaultextension=extension,
+            filetypes=[(f"{format_name} (*{extension})", f"*{extension}"),
+                       ("All Files", "*.*")])
         if fn:
+            root, existing_extension = os.path.splitext(fn)
+            if existing_extension.lower() != extension:
+                fn = root + extension
             self.output_path_var.set(fn)
+
+    def _change_output_format(self, format_name):
+        extension = OUTPUT_FORMATS.get(format_name, ".docx")
+        self.db.set_setting("output_format", format_name)
+        current_path = self.output_path_var.get().strip()
+        if current_path:
+            root, _ = os.path.splitext(current_path)
+            self.output_path_var.set(root + extension)
 
     def _toggle_export(self):
         state = "normal" if self.export_var.get() else "disabled"
         self.output_entry.configure(state=state)
+        self.output_format_combo.configure(state=state)
         self.browse_out_btn.configure(state=state)
+
+    def _save_generated_output(self, content):
+        if not self.export_var.get():
+            return
+        format_name = self.output_format_var.get()
+        extension = OUTPUT_FORMATS.get(format_name, ".docx")
+        output_path = self.output_path_var.get().strip()
+        if not output_path:
+            self.append_to_terminal("warn", "Output was not saved: no output path is set.")
+            return
+        root, current_extension = os.path.splitext(output_path)
+        if current_extension.lower() != extension:
+            output_path = root + extension
+            self.output_path_var.set(output_path)
+
+        try:
+            if format_name in ("Text", "Markdown"):
+                with open(output_path, "w", encoding="utf-8") as output_file:
+                    output_file.write(content)
+            elif format_name == "HTML":
+                escaped = html.escape(content)
+                html_doc = (
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    "<title>LAYA generated document</title>"
+                    "<style>body{font:16px/1.6 Segoe UI,Arial,sans-serif;"
+                    "max-width:850px;margin:48px auto;padding:0 24px;color:#202532}"
+                    "pre{white-space:pre-wrap;font:inherit}</style></head>"
+                    f"<body><pre>{escaped}</pre></body></html>")
+                with open(output_path, "w", encoding="utf-8") as output_file:
+                    output_file.write(html_doc)
+            elif format_name == "DOCX":
+                document = Document()
+                for line in content.splitlines():
+                    trimmed = line.strip()
+                    if not trimmed:
+                        document.add_paragraph()
+                    elif trimmed.startswith("### "):
+                        document.add_heading(trimmed[4:], level=3)
+                    elif trimmed.startswith("## "):
+                        document.add_heading(trimmed[3:], level=2)
+                    elif trimmed.startswith("# "):
+                        document.add_heading(trimmed[2:], level=1)
+                    elif re.match(r"^[-*+]\s+", trimmed):
+                        document.add_paragraph(
+                            re.sub(r"^[-*+]\s+", "", trimmed),
+                            style="List Bullet")
+                    elif re.match(r"^\d+[.)]\s+", trimmed):
+                        document.add_paragraph(
+                            re.sub(r"^\d+[.)]\s+", "", trimmed),
+                            style="List Number")
+                    else:
+                        document.add_paragraph(trimmed)
+                document.save(output_path)
+            elif format_name == "PDF":
+                from reportlab.lib.pagesizes import letter
+                from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                from reportlab.lib.units import inch
+                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+
+                styles = getSampleStyleSheet()
+                styles.add(ParagraphStyle(
+                    name="DocumentTitle", parent=styles["Title"],
+                    alignment=0, spaceAfter=14))
+                styles.add(ParagraphStyle(
+                    name="DocumentBody", parent=styles["BodyText"],
+                    leading=15, spaceAfter=7))
+                story = []
+                for line in content.splitlines():
+                    trimmed = line.strip()
+                    if not trimmed:
+                        story.append(Spacer(1, 0.12 * inch))
+                        continue
+                    style = styles["DocumentBody"]
+                    if trimmed.startswith("# "):
+                        trimmed = trimmed[2:]
+                        style = styles["DocumentTitle"]
+                    elif trimmed.startswith("## "):
+                        trimmed = trimmed[3:]
+                        style = styles["Heading2"]
+                    elif trimmed.startswith("### "):
+                        trimmed = trimmed[4:]
+                        style = styles["Heading3"]
+                    elif re.match(r"^[-*+]\s+", trimmed):
+                        trimmed = "-  " + re.sub(r"^[-*+]\s+", "", trimmed)
+                    safe_text = html.escape(trimmed)
+                    safe_text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", safe_text)
+                    safe_text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", safe_text)
+                    story.append(Paragraph(safe_text, style))
+                SimpleDocTemplate(
+                    output_path, pagesize=letter,
+                    rightMargin=0.75 * inch, leftMargin=0.75 * inch,
+                    topMargin=0.75 * inch, bottomMargin=0.75 * inch
+                ).build(story)
+            self.append_to_terminal("ok", f"Generated document saved: {output_path}")
+        except Exception as exc:
+            self.append_to_terminal("err", f"Could not save generated document: {exc}")
 
     # --------------------------------------------------------
     # EXPORT & HISTORY MENU ACTIONS
@@ -2063,6 +3679,7 @@ class AgenticStudioApp(ctk.CTk):
 
     def _finalise_agent_bubble(self, full_text, chat_type="workspace"):
         def _do():
+            self._last_agent_response = full_text
             is_gen = (chat_type == "general")
             scroll_widget = self.general_scroll if is_gen else self.chat_scroll
             frame = self._general_stream_agent_frame if is_gen else self._stream_agent_frame
@@ -2088,11 +3705,16 @@ class AgenticStudioApp(ctk.CTk):
 
                 b = MessageBubble(scroll_widget, "agent", full_text,
                                   copy_callback=self._copy_to_clipboard,
-                                  rerun_callback=self.execute_agent_code)
+                                  rerun_callback=self.execute_agent_code,
+                                  quote_callback=lambda value: self._quote_to_input(
+                                      value, chat_type),
+                                  speak_callback=self._speak_text)
                 b.grid(row=row, column=0, sticky="ew", pady=2)
 
                 if not is_gen:
                     self._update_msg_count()
+                if self.voice_speak_replies:
+                    self._speak_text(full_text)
                 self.after(60, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
         self.after(0, _do)
 
@@ -2113,6 +3735,14 @@ class AgenticStudioApp(ctk.CTk):
         self.clipboard_append(text)
         self.set_status("Copied!", "idle")
         self.after(2000, lambda: self.set_status("Idle", "idle"))
+
+    def _quote_to_input(self, text, chat_type="workspace"):
+        widget = self.general_input if chat_type == "general" else self.chat_input
+        excerpt = " ".join(text.split())[:240]
+        current = widget.get().strip()
+        widget.delete(0, "end")
+        widget.insert(0, f'{current} "{excerpt}" '.strip())
+        widget.focus_set()
 
     # --------------------------------------------------------
     # PROCESSING STATE
@@ -2148,16 +3778,37 @@ class AgenticStudioApp(ctk.CTk):
     # --------------------------------------------------------
     # SELF-HEALING EXECUTION ENGINE
     # --------------------------------------------------------
-    def execute_agent_code(self, llm_response, max_retries=3):
+    def _script_runtime_context(self):
+        source_files = [os.path.abspath(path) for path in self.selected_files
+                        if os.path.isfile(path)]
+        pillow_version = getattr(sys.modules.get("PIL"), "__version__", "unknown")
+        source_root = (os.path.dirname(source_files[0])
+                       if source_files else os.getcwd())
+        return (
+            f"Generated scripts run on Windows with Python {sys.version.split()[0]} "
+            f"and Pillow {pillow_version}. Working directory: {source_root}.\n"
+            f"Selected source files (absolute paths): {json.dumps(source_files)}\n"
+            "Use the absolute paths when opening source documents. Use Pillow "
+            "ImageDraw.textbbox instead of removed textsize; ImageDraw.line does "
+            "not support dash=, so draw dashed lines as segments."
+        )
+
+    def execute_agent_code(self, llm_response, max_retries=5):
         blocks = re.findall(r'```python\n(.*?)\n```', llm_response, re.DOTALL)
         if not blocks: return
         self.is_executing = True
         self.set_status("Executing generated script…", "busy")
+        source_files = [os.path.abspath(path) for path in self.selected_files
+                        if os.path.isfile(path)]
         threading.Thread(target=self._exec_thread,
-                         args=(blocks, max_retries), daemon=True).start()
+                         args=(blocks, max_retries, source_files), daemon=True).start()
 
-    def _exec_thread(self, blocks, max_retries):
+    def _exec_thread(self, blocks, max_retries, source_files=None):
         model = self.model_var.get()
+        source_files = source_files or []
+        working_directory = (os.path.dirname(source_files[0])
+                             if source_files else os.getcwd())
+        pillow_version = getattr(sys.modules.get("PIL"), "__version__", "unknown")
         try:
             for idx, code in enumerate(blocks):
                 tmp = tempfile.mkdtemp()
@@ -2172,10 +3823,12 @@ class AgenticStudioApp(ctk.CTk):
                             f.write(cur)
                         try:
                             t0 = time.time()
+                            script_env = os.environ.copy()
+                            script_env["LAYA_SOURCE_FILES"] = json.dumps(source_files)
                             res = subprocess.run(
                                 [sys.executable, sp],
                                 capture_output=True, text=True,
-                                cwd=tmp, timeout=60)
+                                cwd=working_directory, env=script_env, timeout=60)
                             ms = int((time.time() - t0) * 1000)
                             self.db.log_model_usage(self.session_id, model,
                                                     len(cur), len(res.stdout), ms)
@@ -2186,15 +3839,23 @@ class AgenticStudioApp(ctk.CTk):
                             else:
                                 err = res.stderr.strip()
                                 self.append_to_terminal("err", f"Script failed:\n{err}")
-                                if attempt < max_retries and ollama:
+                                if attempt < max_retries:
                                     self.append_to_terminal("warn", "Self-healing…")
-                                    fix = ollama.chat(
+                                    fix = self.model_mgr.chat(
                                         model=model,
                                         messages=[{"role": "user",
                                                    "content": (
                                                        f"Script failed:\n```\n{err}\n```\n"
+                                                       f"Available source files: {json.dumps(source_files)}\n"
+                                                       f"Runtime: Windows, Pillow {pillow_version}.\n"
                                                        f"Code:\n```python\n{cur}\n```\n"
-                                                       "Return ONLY the fixed script in a ```python block.")}],
+                                                       "Fix all visible issues and preserve the script's purpose. "
+                                                       "Use Pillow ImageDraw.textbbox (textsize was removed); "
+                                                       "ImageDraw.line has no dash= parameter, so draw dashed "
+                                                       "lines as segments. Use the provided absolute source paths "
+                                                       "instead of assuming the script directory. Keep imports "
+                                                       "within the installed requirements. Return ONLY the fixed "
+                                                       "script in a ```python block.")}],
                                         options={"num_ctx": 32768, "temperature": 0.1},
                                         stream=False)
                                     fixed = re.findall(r'```python\n(.*?)\n```',
@@ -2227,19 +3888,20 @@ class AgenticStudioApp(ctk.CTk):
         if self.is_processing: return
         directives = self.prompt_text.get("0.0", "end").strip()
         temperature = round(self.temp_var.get(), 2)
-        if not self.selected_files:
-            messagebox.showerror("No Files", "Add at least one document first.")
+        if not self.model_mgr.is_configured:
+            messagebox.showerror("Model Provider",
+                "Configure a model provider and endpoint before running analysis.")
             return
-        if ollama is None:
-            messagebox.showerror("Missing Dependency",
-                "Ollama is not installed. Install with: pip install ollama")
-            return
-        # Inject docx export directive if enabled
-        out_path = self.output_path_var.get().strip().replace("\\", "/")
-        if self.export_var.get() and out_path:
+        if self.export_var.get() and not self.output_path_var.get().strip():
+            self.browse_output()
+            if not self.output_path_var.get().strip():
+                return
+        if self.export_var.get():
             directives += (
-                f"\n\nCRITICAL DIRECTIVE: Write a complete `python-docx` script that saves "
-                f"the full analysis report to '{out_path}'. Wrap it in a ```python block."
+                f"\n\nPrepare the completed response as a polished, complete "
+                f"{self.output_format_var.get()} document. Return the document content "
+                "directly; the application will save it in the selected format. "
+                "Do not write a file-generation script."
             )
         self.right_tabs.set("  💬 Workspace  ")
         self.after(0, lambda: self.toggle_processing_state(True))
@@ -2262,6 +3924,12 @@ class AgenticStudioApp(ctk.CTk):
                 master_raw += f'\n<file name="{os.path.basename(fp)}">\n{st["raw"]}\n</file>\n'
                 self.db.log_file_access(self.session_id, fp, "extract")
 
+            if not master_raw.strip():
+                master_raw = (
+                    "No source documents were attached. Create the requested content "
+                    "from the user's directives without assuming an input document."
+                )
+
             TOKEN_LIMIT = 20000
             if len(master_raw) > TOKEN_LIMIT * 4:
                 self.append_to_terminal("warn",
@@ -2272,7 +3940,7 @@ class AgenticStudioApp(ctk.CTk):
                     self.append_to_terminal("info",
                         f"Mapping chunk {i+1}/{len(chunks)}…")
                     t0 = time.time()
-                    r = ollama.chat(
+                    r = self.model_mgr.chat(
                         model=self.map_model_var.get(),
                         messages=[{"role": "user",
                                    "content": f"Directive: {directives}\nExtract:\n{chunk}"}],
@@ -2310,10 +3978,11 @@ class AgenticStudioApp(ctk.CTk):
                 f"Synthesizing with {self.model_var.get()} (T={temperature})…")
             self._show_typing()
 
-            sys_p = (f"You are a master data agent. Strategy: {strategy}\n\n"
+            sys_p = (f"You are a master data agent. Strategy: {strategy}\n"
+                     f"{self._script_runtime_context()}\n\n"
                      f"=== DATA ===\n{self.document_context}")
             t0 = time.time()
-            stream = ollama.chat(
+            stream = self.model_mgr.chat(
                 model=self.model_var.get(),
                 messages=[{"role": "system", "content": sys_p},
                           {"role": "user", "content": directives}],
@@ -2340,6 +4009,8 @@ class AgenticStudioApp(ctk.CTk):
                               full[:300])
             self.db.upsert_session(self.session_id, len(self.selected_files),
                                    self._msg_count, self.model_var.get())
+            self.after(0, lambda response=full:
+                       self._save_generated_output(response))
             self.execute_agent_code(full)
 
         except Exception as e:
@@ -2352,12 +4023,9 @@ class AgenticStudioApp(ctk.CTk):
         if self.is_processing or self.is_executing: return
         text = self.chat_input.get().strip()
         if not text: return
-        if not self.document_context:
-            messagebox.showwarning("Not Ready", "Run Initialize Analysis first.")
-            return
-        if ollama is None:
-            messagebox.showerror("Missing Dependency",
-                "Ollama is not installed. Install with: pip install ollama")
+        if not self.model_mgr.is_configured:
+            messagebox.showerror("Model Provider",
+                "Configure a model provider and endpoint before sending a message.")
             return
         self.chat_input.delete(0, "end")
         self.after(0, lambda: self.toggle_processing_state(True))
@@ -2380,8 +4048,9 @@ class AgenticStudioApp(ctk.CTk):
                 self.append_to_terminal("info", "Trimmed oldest message from context window.")
 
             messages = [{"role": "system",
-                         "content": (f"You are a helpful data agent.\n\n"
-                                     f"Context:\n{self.document_context}\n\n"
+                         "content": (f"You are a helpful writing and data agent.\n\n"
+                                     f"{self._script_runtime_context()}\n\n"
+                                     f"Context:\n{self.document_context or 'No source document context is available.'}\n\n"
                                      "Wrap Python scripts in ```python blocks.")}]
             for r in self._workspace_history:
                 role = "assistant" if r["role"] == "agent" else r["role"]
@@ -2391,7 +4060,7 @@ class AgenticStudioApp(ctk.CTk):
             self._show_typing()
 
             t0 = time.time()
-            stream = ollama.chat(
+            stream = self.model_mgr.chat(
                 model=self.model_var.get(),
                 messages=messages,
                 options={"num_ctx": 65536,
@@ -2428,9 +4097,9 @@ class AgenticStudioApp(ctk.CTk):
         if self.is_processing or self.is_executing: return
         text = self.general_input.get().strip()
         if not text: return
-        if ollama is None:
-            messagebox.showerror("Missing Dependency",
-                "Ollama is not installed. Install with: pip install ollama")
+        if not self.model_mgr.is_configured:
+            messagebox.showerror("Model Provider",
+                "Configure a model provider and endpoint before sending a message.")
             return
 
         self.general_input.delete(0, "end")
@@ -2463,7 +4132,7 @@ class AgenticStudioApp(ctk.CTk):
             self.after(60, lambda: self.general_scroll._parent_canvas.yview_moveto(1.0))
 
             t0 = time.time()
-            stream = ollama.chat(
+            stream = self.model_mgr.chat(
                 model=self.model_var.get(),
                 messages=messages,
                 options={"num_ctx": 16384, "temperature": round(self.temp_var.get(), 2)},

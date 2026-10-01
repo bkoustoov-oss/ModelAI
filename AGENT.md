@@ -34,12 +34,12 @@ The application is designed for **agentic development** – i.e., creating auton
 | Module | Purpose |
 |--------|---------|
 | **DatabaseManager** | Extended SQLite wrapper that logs user/agent messages per session, file accesses, model usage statistics, queries, and stores application settings. |
-| **ModelManager** | Dynamically fetches and manages available models from Ollama in the background, allowing selection of dedicated models for inference and map-reduce operations. |
+| **ModelManager** | Connects to local/remote Ollama or OpenAI-compatible endpoints, lists models, normalizes streaming responses, and stores API keys in the OS credential vault. |
 | **extract_dual_stream_from_file** | Handles file‑type specific extraction (OCR for images, `pdfplumber` for PDFs, `python-docx` for DOCX, `pandas` for CSV/Excel, plain‑text). Returns `{spatial, raw}` streams. |
 | **chunk_text** | Utility to split large text into safe‑size chunks (default 80 000 characters) to stay within LLM context windows. |
 | **AgenticStudioApp** (CTk subclass) | Main GUI class – builds the fixed layout left panel (file list, inference control, models) and the multi-tab right panel (Workspace, General Chat, Terminal, Preview). Handles user actions, voice inputs, orchestrates the pipeline, manages themes, and displays streaming output. |
 | **execute_agent_code** | Detects ```python``` blocks in LLM responses, writes them to a temporary file, runs them via `subprocess.run`, captures stdout/stderr, and if execution fails, automatically prompts the LLM for a corrected script (self‑healing). |
-| **run_initial_agent** | Core pipeline for the first analysis: extracts all files, performs map‑reduce chunking if needed, consults the LARA decision engine for a strategy, synthesizes a final response with the chosen inference LLM, streams the answer to the chat, logs it, and triggers any generated code execution. |
+| **run_initial_agent** | Core pipeline for the first analysis: optionally extracts uploaded files, performs map-reduce chunking if needed, consults the decision engine, synthesizes and streams the response, optionally exports it directly, and triggers generated code execution. Directives can create content without source files. |
 | **_process_followup** / **_process_general_chat** | Handles subsequent user queries in the document context workspace or general chat, streams the agent’s answer, logs it, and again runs any code blocks. |
 
 ---
@@ -76,12 +76,12 @@ The application is designed for **agentic development** – i.e., creating auton
 2. **Setup Environment** – From the Menu, you can select Themes, View Model Usage Logs, or configure Inference/Map-Reduce models in Preferences.
 3. **Add Files** – Click *+ Add Files* and select any supported documents.
 4. **Set Directives** – In the *Agent Directives* textbox, type or speak (using the Microphone button) a high‑level instruction.
-5. **Enable Export (Optional)** – Check the box under *Output / Export* and browse for a path. The system will automatically append a critical directive to force the LLM to generate a `python-docx` script.
+5. **Create or Export (Optional)** – Source files are optional; directives can ask the agent to create a letter or other content from scratch. Enable *Output / Export*, choose DOCX/PDF/TXT/Markdown/HTML, and select a path to save the finished response directly.
 6. **Run** – Press *▶ Initialize Analysis*.
-   - The system extracts data, chunks if needed, decides a strategy, synthesizes a response, streams it, and runs any generated code.
+   - The system optionally extracts data, chunks if needed, decides a strategy, synthesizes a response with the selected provider, streams it, saves requested exports, and runs generated code.
    - Check the **System Terminal** tab to view live detailed logs of the process.
    - Mouse wheel scrolling works in both Workspace and General Chat panes via a custom `bind_all` handler that walks the widget ancestry tree to route events correctly.
-7. **Interact** – Use the Workspace chat input or General Chat tab to ask follow‑up questions or engage the AI. Right-click messages to copy or re-run code.
+7. **Interact** – Use Workspace or General Chat for follow-up questions. Voice can route requests, execute directives, or read the latest response aloud; stop speech from the title bar or voice panel. Right-click messages to copy or re-run code.
 8. **Review** – The *Preview* tab shows raw extraction previews for selected files in the left panel.
 
 ---
@@ -93,8 +93,8 @@ The application is designed for **agentic development** – i.e., creating auton
 2. Extend `extract_dual_stream_from_file` with a new `elif ext == '.xyz':` block that returns a `{spatial, raw}` dictionary.
 
 ### Custom LLM or Model Configuration
-- The system defaults to using local Ollama models. The `ModelManager` class fetches installed models automatically.
-- You can extend the API calls within `run_initial_agent` or `_process_followup` to support different providers (like OpenAI) by ensuring the returned dictionary format matches the expected `message['content']` field.
+- The system defaults to local Ollama. Configure remote Ollama or an OpenAI-compatible endpoint from **Models → Provider / Endpoint**.
+- `ModelManager` normalizes provider responses to the `message['content']` shape expected by the UI.
 
 ### Advanced Self‑Healing
 - Increase `max_retries` in `execute_agent_code` or customize the repair prompt to include unit‑test scaffolding.
@@ -118,6 +118,10 @@ This project is provided under the GNU General Public License v3.0. It utilizes 
 - **CustomTkinter** – modern dark/light‑theme UI.
 - **pdfplumber**, **python‑docx**, **pandas**, **pytesseract** – file handling utilities.
 - **SpeechRecognition** – voice to text capabilities.
+- **OpenAI Python client** – OpenAI-compatible providers.
+- **keyring** – OS credential-vault storage for provider API keys.
+- **pyttsx3** – system text-to-speech.
+- **ReportLab** – PDF export.
 - **Paramiko** – SSH connections and SFTP file transfer.
 - **Tesseract OCR** – required for image and PDF OCR.
 

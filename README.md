@@ -5,10 +5,11 @@ A desktop workspace for analyzing documents and chatting with local Ollama model
 ## Features
 
 - Analyze PDF, DOCX, CSV/Excel, text, and image files.
+- Create letters and other content directly from Agent Directives without uploading a source file.
 - Keep document-focused analysis separate from general chat.
-- Select inference and map-reduce models from the Ollama models available locally.
+- Select inference and map-reduce models from local/remote Ollama or OpenAI-compatible endpoints.
 - Save chat history and application settings in a local SQLite database.
-- Use optional speech input, document export, and SSH/SFTP tools.
+- Use wake-word voice commands, interruptible read-aloud, DOCX/PDF/TXT/Markdown/HTML export, and SSH/SFTP tools.
 
 ## Requirements
 
@@ -24,16 +25,10 @@ From PowerShell in the project directory, create an environment and install the 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install customtkinter python-docx laya ollama Pillow pytesseract pdfplumber pandas openpyxl SpeechRecognition paramiko
+python -m pip install -r requirements.txt
 ```
 
-Optional microphone input requires PyAudio:
-
-```powershell
-python -m pip install PyAudio
-```
-
-Install [Ollama](https://ollama.com/download) separately, then download a model, for example:
+Install [Ollama](https://ollama.com/download) separately if using an Ollama server. For local Ollama, download a model, for example:
 
 ```powershell
 ollama pull llama3.2
@@ -47,11 +42,13 @@ Start the application:
 python laya_agentic_studio_v15.py
 ```
 
-## Ollama Setup
+## Model Providers and Voice
 
-In the app, open **Models → Ollama Setup** (or select **Ollama Setup** beside the model refresh button). Use **Check & Refresh Models** to connect to the local Ollama service, or enter a local model name and select **Pull** to download it. New users can select **Create Ollama Account**; for cloud models, select **Ollama Cloud Sign-in**, complete Ollama's sign-in in the new terminal window, then refresh the model list. Agentic Studio does not create a separate user account or store Ollama credentials.
+Open **Models → Provider / Endpoint** to configure local Ollama, remote Ollama, or an OpenAI-compatible local/remote API. Connect to list available models, then choose separate inference and map-reduce models. API keys are stored in the operating system credential vault. **Ollama Setup** can check a configured Ollama endpoint and pull models.
 
-Ollama-hosted `gpt-oss` models are not the same service as OpenAI's hosted GPT models. This app currently connects to Ollama; it does not configure an OpenAI API account.
+Voice settings include the “Ok Chacha” wake phrase, routing to Agent Directives or Workspace Chat, command execution, speech rate, and female/male read-aloud voice selection. Wake-word and dictation transcription use Google's online speech recognition service when enabled. Read-aloud playback can be stopped from the title bar, voice panel, or by saying “stop speaking.”
+
+With **Output / Export** enabled, the app directly saves its completed response as DOCX, PDF, TXT, Markdown, or HTML.
 
 The application creates `agentic_memory.db` in its working directory to store local history and settings. Keep this file private; it is excluded from Git by default.
 
