@@ -511,8 +511,44 @@ def extract_dual_stream_from_file(file_path, log_callback=None):
                 rw += (r or "") + "\n"
         return {"spatial": sp, "raw": rw}
     elif ext == '.docx':
-        doc = Document(file_path)
-        text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        try:
+            doc = Document(file_path)
+            text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        except Exception as package_error:
+            try:
+                import xml.etree.ElementTree as element_tree
+                import zipfile
+
+                namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                paragraph_tag = f"{{{namespace}}}p"
+                text_tag = f"{{{namespace}}}t"
+                tab_tag = f"{{{namespace}}}tab"
+                break_tags = {f"{{{namespace}}}br", f"{{{namespace}}}cr"}
+                with zipfile.ZipFile(file_path) as package:
+                    root = element_tree.fromstring(
+                        package.read("word/document.xml"))
+                paragraphs = []
+                for paragraph in root.iter(paragraph_tag):
+                    pieces = []
+                    for node in paragraph.iter():
+                        if node.tag == text_tag:
+                            pieces.append(node.text or "")
+                        elif node.tag == tab_tag:
+                            pieces.append("\t")
+                        elif node.tag in break_tags:
+                            pieces.append("\n")
+                    paragraph_text = "".join(pieces).strip()
+                    if paragraph_text:
+                        paragraphs.append(paragraph_text)
+                text = "\n".join(paragraphs)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"Could not read DOCX with python-docx or XML fallback: "
+                    f"{fallback_error}") from package_error
+            if log_callback:
+                log_callback(
+                    f"[{os.path.basename(file_path)}] Recovered document text; "
+                    "malformed embedded media was skipped.")
         return {"spatial": text, "raw": text}
     elif ext == '.doc':
         try:
