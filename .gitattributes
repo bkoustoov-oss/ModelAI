@@ -1,0 +1,2 @@
+packaging/install_linux.sh text eol=lf
+packaging/install_macos.command text eol=lf

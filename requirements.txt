@@ -4,6 +4,9 @@ laya
 ollama
 openai
 keyring
+platformdirs
+cryptography
+packaging
 Pillow
 pytesseract
 SpeechRecognition

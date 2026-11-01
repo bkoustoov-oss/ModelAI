@@ -16,6 +16,13 @@ import shutil
 import time
 import webbrowser
 from urllib.parse import urlsplit
+from platformdirs import user_data_dir
+from app_version import APP_VERSION
+from update_service import (
+    UpdateError, check_for_update, download_package,
+    launch_installer_update)
+
+APP_ID = "bkoustoov-oss/ModelAI"
 
 # Force offline caching
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -131,6 +138,14 @@ OUTPUT_FORMATS = {
     "HTML": ".html",
 }
 
+MANUAL_STRATEGIES = {
+    "Analyze and summarize": "Analyze the provided information and summarize the main findings.",
+    "Compare sources": "Compare the provided sources and explain similarities and differences.",
+    "Extract facts": "Extract requested facts and answer directly from the available evidence.",
+    "Create or rewrite": "Create or rewrite polished content according to the user's directives.",
+    "Explore alternatives": "Generate multiple creative options and compare their tradeoffs.",
+}
+
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
@@ -146,8 +161,8 @@ except ImportError:
 try:
     import laya
     decision_engine = laya.load("convaiinnovations/laya")
-except ImportError:
-    missing_deps.append("laya")
+except Exception as exc:
+    missing_deps.append(f"LAYA decision engine unavailable: {exc}")
     decision_engine = None
 
 try:
@@ -199,7 +214,17 @@ except ImportError:
 # COMMIT 1 — EXTENDED DATABASE (7G)
 # ============================================================
 class DatabaseManager:
-    def __init__(self, db_path="agentic_memory.db"):
+    def __init__(self, db_path=None):
+        if db_path is None:
+            app_data_dir = user_data_dir("LAYA Agentic Studio", "Bkoustoov")
+            os.makedirs(app_data_dir, exist_ok=True)
+            db_path = os.path.join(app_data_dir, "agentic_memory.db")
+            legacy_path = os.path.abspath("agentic_memory.db")
+            if (not os.path.exists(db_path) and os.path.isfile(legacy_path)
+                    and os.path.normcase(legacy_path) != os.path.normcase(db_path)):
+                with sqlite3.connect(legacy_path) as legacy_db:
+                    with sqlite3.connect(db_path) as user_db:
+                        legacy_db.backup(user_db)
         self.db_path = db_path
         self._init_db()
 
@@ -1097,7 +1122,7 @@ class SSHManager:
 class AgenticStudioApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("LAYA Agentic Studio v15")
+        self.title(f"LAYA Agentic Studio {APP_VERSION}")
         self.geometry("1480x960")
         self.minsize(1200, 800)
         self.configure(fg_color=PALETTE["bg_deep"])
@@ -1114,6 +1139,14 @@ class AgenticStudioApp(ctk.CTk):
             value=self.db.get_setting("inference_model", ""))
         self.map_model_var = ctk.StringVar(
             value=self.db.get_setting("map_model", ""))
+        self.response_style = self.db.get_setting("response_style", "Balanced")
+        self.allow_generated_code = self.db.get_setting(
+            "allow_generated_code", "0") == "1"
+        self.decision_mode = self.db.get_setting("decision_mode", "LAYA")
+        self.manual_strategy = self.db.get_setting(
+            "manual_strategy", "Analyze and summarize")
+        self.review_operations = self.db.get_setting(
+            "review_operations", "1") == "1"
         self.model_mgr = ModelManager(self.db)
         self.ssh_mgr = SSHManager(log_callback=self.append_to_terminal)
         self.session_id = str(uuid.uuid4())[:8]
@@ -1289,6 +1322,8 @@ class AgenticStudioApp(ctk.CTk):
         hlp = _menu()
         hlp.add_command(label="  About",             command=self._show_about)
         hlp.add_command(label="  Keyboard Shortcuts",command=self._show_shortcuts)
+        hlp.add_separator()
+        hlp.add_command(label="  Check for Updates…", command=self._check_for_updates)
         self.menubar.add_cascade(label=" Help ", menu=hlp)
 
     # --------------------------------------------------------
@@ -1306,7 +1341,7 @@ class AgenticStudioApp(ctk.CTk):
         tk.Label(left, text="LAYA  Agentic Studio",
                  font=("Consolas", 12, "bold"),
                  bg=PALETTE["bg_deep"], fg=PALETTE["text_hi"]).pack(side="left")
-        tk.Label(left, text=" v15",
+        tk.Label(left, text=f" v{APP_VERSION}",
                  font=("Consolas", 10),
                  bg=PALETTE["bg_deep"], fg=PALETTE["accent"]).pack(side="left")
 
@@ -1491,6 +1526,52 @@ class AgenticStudioApp(ctk.CTk):
         self.temp_label.grid(row=1, column=0, sticky="w")
         self.update_temp_label(self.temp_var.get())
 
+        decision_frame = ctk.CTkFrame(temp_frame, fg_color="transparent")
+        decision_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        decision_frame.grid_columnconfigure(0, weight=1)
+        decision_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            decision_frame, text="Strategy control",
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1),
+            text_color=PALETTE["text_mid"]
+        ).grid(row=0, column=0, sticky="w")
+        self.decision_mode_var = ctk.StringVar(value=self.decision_mode)
+        ctk.CTkSegmentedButton(
+            decision_frame, values=["LAYA", "Manual"],
+            variable=self.decision_mode_var,
+            command=self._on_decision_mode_changed,
+            selected_color=PALETTE["accent"],
+            selected_hover_color=PALETTE["accent_hot"],
+            unselected_color=PALETTE["bg_card"],
+            unselected_hover_color=PALETTE["border"],
+            text_color=PALETTE["text_hi"], height=24
+        ).grid(row=0, column=1, sticky="e")
+        self.manual_strategy_var = ctk.StringVar(value=self.manual_strategy)
+        self.manual_strategy_combo = ctk.CTkComboBox(
+            temp_frame, variable=self.manual_strategy_var,
+            values=list(MANUAL_STRATEGIES),
+            state="normal" if self.decision_mode == "Manual" else "disabled",
+            command=self._on_manual_strategy_changed,
+            fg_color=PALETTE["bg_input"],
+            border_color=PALETTE["border"],
+            button_color=PALETTE["accent"],
+            text_color=PALETTE["text_hi"],
+            dropdown_fg_color=PALETTE["bg_card"],
+            dropdown_text_color=PALETTE["text_hi"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1), height=27)
+        self.manual_strategy_combo.grid(row=3, column=0, sticky="ew", pady=(3, 0))
+        self.review_operations_var = tk.BooleanVar(value=self.review_operations)
+        ctk.CTkCheckBox(
+            temp_frame, text="Review run plan before operating",
+            variable=self.review_operations_var,
+            command=self._save_review_operations,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hot"],
+            text_color=PALETTE["text_mid"],
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1),
+            checkbox_width=14, checkbox_height=14
+        ).grid(row=4, column=0, sticky="w", pady=(2, 0))
+
         self._section_label_grid(11, "OUTPUT / EXPORT")
 
         # Export checkbox + path entry on same row sub-frame
@@ -1619,10 +1700,10 @@ class AgenticStudioApp(ctk.CTk):
 
         self.chat_scroll = ctk.CTkScrollableFrame(
             self.tab_chat,
-            fg_color=PALETTE["bg_deep"],
-            scrollbar_fg_color=PALETTE["bg_glass"],
-            scrollbar_button_color=PALETTE["accent"],
-            scrollbar_button_hover_color=PALETTE["accent_hot"])
+            fg_color=PALETTE["bg_panel"],
+            scrollbar_fg_color=PALETTE["bg_card"],
+            scrollbar_button_color=PALETTE["border_hi"],
+            scrollbar_button_hover_color=PALETTE["accent"])
         self.chat_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
         self.chat_scroll.grid_columnconfigure(0, weight=1)
 
@@ -1679,10 +1760,10 @@ class AgenticStudioApp(ctk.CTk):
 
         self.general_scroll = ctk.CTkScrollableFrame(
             self.tab_general,
-            fg_color=PALETTE["bg_deep"],
-            scrollbar_fg_color=PALETTE["bg_glass"],
-            scrollbar_button_color=PALETTE["accent"],
-            scrollbar_button_hover_color=PALETTE["accent_hot"])
+            fg_color=PALETTE["bg_panel"],
+            scrollbar_fg_color=PALETTE["bg_card"],
+            scrollbar_button_color=PALETTE["border_hi"],
+            scrollbar_button_hover_color=PALETTE["accent"])
         self.general_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=(2, 0))
         self.general_scroll.grid_columnconfigure(0, weight=1)
 
@@ -2988,8 +3069,9 @@ class AgenticStudioApp(ctk.CTk):
             pass
 
     def _setup_scroll_bindings(self):
-        """Bind mouse wheel scrolling for workspace and general chat panels."""
+        """Route high-resolution pointer and IDE navigation keys to the chat under focus."""
         scroll_frames = (self.chat_scroll, self.general_scroll)
+        wheel_remainders = {sf._parent_canvas: 0.0 for sf in scroll_frames}
         for sf in scroll_frames:
             try:
                 sf._parent_canvas.unbind("<MouseWheel>")
@@ -3010,19 +3092,41 @@ class AgenticStudioApp(ctk.CTk):
             canvas = _scroll_target(event.widget)
             if canvas is None:
                 return
-            canvas.yview_scroll(units, "units")
+            canvas.yview_scroll(units * 3, "units")
             return "break"
 
         def _on_mousewheel(event):
             delta = getattr(event, "delta", 0)
-            units = int(-delta / 120)
-            if units == 0 and delta:
-                units = -1 if delta > 0 else 1
-            return _scroll_by(event, units) if units else None
+            canvas = _scroll_target(event.widget)
+            if canvas is None or not delta:
+                return
+            notches = -float(delta) / 120.0
+            accumulated = wheel_remainders.get(canvas, 0.0) + notches
+            units = int(accumulated)
+            wheel_remainders[canvas] = accumulated - units
+            if units:
+                canvas.yview_scroll(units * 3, "units")
+            return "break"
+
+        def _scroll_home(event):
+            canvas = _scroll_target(event.widget)
+            if canvas is not None:
+                canvas.yview_moveto(0.0)
+                return "break"
+
+        def _scroll_end(event):
+            canvas = _scroll_target(event.widget)
+            if canvas is not None:
+                canvas.yview_moveto(1.0)
+                return "break"
 
         self.bind_all("<MouseWheel>", _on_mousewheel, add="+")
         self.bind_all("<Button-4>", lambda e: _scroll_by(e, -1), add="+")
         self.bind_all("<Button-5>", lambda e: _scroll_by(e, 1), add="+")
+        self.bind_all("<Prior>", lambda e: _scroll_by(e, -12), add="+")
+        self.bind_all("<Next>", lambda e: _scroll_by(e, 12), add="+")
+        self.bind_all("<Home>", _scroll_home, add="+")
+        self.bind_all("<End>", _scroll_end, add="+")
 
     def _show_text_context_menu(self, event):
         widget = event.widget
@@ -3141,6 +3245,39 @@ class AgenticStudioApp(ctk.CTk):
                          border_color=PALETTE["border"],
                          font=ctk.CTkFont(size=FONT_SCALE["body"])).pack(fill="x", padx=8)
 
+        ctk.CTkLabel(
+            body, text="RESPONSE APPROACH",
+            font=ctk.CTkFont(size=FONT_SCALE["small"], weight="bold"),
+            text_color=PALETTE["accent"]).pack(anchor="w", padx=8, pady=(16, 3))
+        response_style_var = ctk.StringVar(value=self.response_style)
+        ctk.CTkComboBox(
+            body, variable=response_style_var,
+            values=["Conservative", "Balanced", "Exploratory"],
+            fg_color=PALETTE["bg_input"], border_color=PALETTE["border"],
+            button_color=PALETTE["accent"], text_color=PALETTE["text_hi"],
+            dropdown_fg_color=PALETTE["bg_card"],
+            dropdown_text_color=PALETTE["text_hi"]
+        ).pack(fill="x", padx=8)
+        ctk.CTkLabel(
+            body,
+            text="Conservative favors lower-risk options. Balanced compares practical tradeoffs. Exploratory surfaces creative alternatives and non-obvious routes with their assumptions and risks.",
+            wraplength=500, justify="left",
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1),
+            text_color=PALETTE["text_lo"]).pack(fill="x", padx=8, pady=(3, 8))
+
+        generated_code_var = tk.BooleanVar(value=self.allow_generated_code)
+        ctk.CTkCheckBox(
+            body, text="Allow AI-generated Python scripts to run",
+            variable=generated_code_var, fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hot"],
+            text_color=PALETTE["text_hi"]).pack(anchor="w", padx=8, pady=(4, 2))
+        ctk.CTkLabel(
+            body,
+            text="Scripts can read or write files and run commands on this computer. Leave this off when you only want an answer or exported document.",
+            wraplength=500, justify="left",
+            font=ctk.CTkFont(size=FONT_SCALE["small"] - 1),
+            text_color=PALETTE["text_lo"]).pack(fill="x", padx=8, pady=(0, 8))
+
         tesseract_var = None
         if 'pytesseract' in sys.modules:
             ctk.CTkLabel(body, text="Tesseract Path",
@@ -3254,6 +3391,11 @@ class AgenticStudioApp(ctk.CTk):
         def save():
             self.db.set_setting("inference_model", self.model_var.get())
             self.db.set_setting("map_model", self.map_model_var.get())
+            self.response_style = response_style_var.get()
+            self.db.set_setting("response_style", self.response_style)
+            self.allow_generated_code = generated_code_var.get()
+            self.db.set_setting("allow_generated_code",
+                                "1" if self.allow_generated_code else "0")
             self.apply_theme(tvar2.get())
             if tesseract_var is not None:
                 pytesseract.pytesseract.tesseract_cmd = tesseract_var.get()
@@ -3389,8 +3531,40 @@ class AgenticStudioApp(ctk.CTk):
         self.output_format_combo.configure(state=state)
         self.browse_out_btn.configure(state=state)
 
+    def _prepare_export_content(self, content):
+        fence_pattern = re.compile(
+            r"```([a-zA-Z0-9_-]*)[ \t]*\r?\n(.*?)\r?\n```",
+            re.DOTALL)
+        blocks = list(fence_pattern.finditer(content))
+        if len(blocks) == 1 and blocks[0].group(1).lower() in {
+                "markdown", "md", "text", "txt", "html", "htm"}:
+            outside = (content[:blocks[0].start()] +
+                       content[blocks[0].end():]).strip()
+            if len(re.findall(r"\w+", outside)) < 10:
+                return blocks[0].group(2).strip()
+
+        python_blocks = [block for block in blocks
+                         if block.group(1).lower() in ("python", "py")]
+        if python_blocks:
+            content = fence_pattern.sub("", content).strip()
+            content = re.sub(
+                r"(?im)^\s*(?:here(?:'s| is) (?:the )?(?:requested )?(?:python )?"
+                r"(?:script|code)|the following (?:python )?(?:script|code))"
+                r"[\s.!:,-]*$", "", content).strip()
+            self.append_to_terminal(
+                "warn", "Python code was removed from the exported document.")
+            if not content:
+                self.append_to_terminal(
+                    "err", "Export cancelled: the model returned a Python script, "
+                    "not document content. Ask for the finished text instead.")
+                return None
+        return content.strip()
+
     def _save_generated_output(self, content):
         if not self.export_var.get():
+            return
+        content = self._prepare_export_content(content)
+        if not content:
             return
         format_name = self.output_format_var.get()
         extension = OUTPUT_FORMATS.get(format_name, ".docx")
@@ -3581,8 +3755,8 @@ class AgenticStudioApp(ctk.CTk):
         tb.configure(state="disabled")
 
     def _show_about(self):
-        messagebox.showinfo("About LAYA Agentic Studio v15",
-            "LAYA Agentic Studio v15\n\n"
+        messagebox.showinfo(f"About LAYA Agentic Studio {APP_VERSION}",
+            f"LAYA Agentic Studio {APP_VERSION}\n\n"
             "A self-healing multimodal AI workspace.\n"
             "Built on LAYA Decision Engine + Ollama.\n\n"
             "© 2026 — Local use only.")
@@ -3596,6 +3770,67 @@ class AgenticStudioApp(ctk.CTk):
             "Enter         Send follow-up\n"
             "Right-click   Context menu on agent bubbles\n"
         )
+
+    def _check_for_updates(self):
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Updates", "Install the packaged application to use automatic updates.")
+            return
+        self.set_status("Checking for signed updates…", "busy")
+
+        def check():
+            try:
+                update = check_for_update(APP_VERSION)
+            except UpdateError as exc:
+                self.after(0, lambda error=str(exc): self._show_update_error(error))
+                return
+            self.after(0, lambda: self._offer_update(update))
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _show_update_error(self, error):
+        self.set_status("Update check failed", "error")
+        messagebox.showerror("Update check failed", error)
+
+    def _offer_update(self, update):
+        if update is None:
+            self.set_status("LAYA is up to date", "idle")
+            messagebox.showinfo(
+                "Updates", f"LAYA Agentic Studio {APP_VERSION} is up to date.")
+            return
+        details = (f"Version {update.version} is available for {update.platform}.\n\n"
+                   f"Release notes:\n{update.release_notes[:1200]}\n\n"
+                   "The signed package will be verified, downloaded, and installed "
+                   "after LAYA closes. Continue?")
+        if not messagebox.askyesno("Update available", details, icon="question"):
+            self.set_status("Update postponed", "idle")
+            return
+        self.set_status(f"Downloading update {update.version}…", "busy")
+        threading.Thread(target=self._download_update, args=(update,),
+                         daemon=True).start()
+
+    def _download_update(self, update):
+        try:
+            archive = download_package(
+                update,
+                progress_callback=lambda received, total:
+                    self.after(0, lambda: self.set_status(
+                        f"Downloading update… {received // 1048576} MB" +
+                        (f" / {total // 1048576} MB" if total else ""), "busy")))
+            self.after(0, lambda: self._launch_update(update, archive))
+        except UpdateError as exc:
+            self.after(0, lambda error=str(exc): self._show_update_error(error))
+
+    def _launch_update(self, update, archive):
+        try:
+            install_root = launch_installer_update(
+                update, archive, os.getpid())
+        except UpdateError as exc:
+            self._show_update_error(str(exc))
+            return
+        self.append_to_terminal(
+            "info", f"Installing {update.version} into {install_root}; closing app.")
+        self.destroy()
 
     def _zoom_in(self):
         FONT_SCALE["body"] = min(FONT_SCALE["body"] + 1, 20)
@@ -3632,6 +3867,13 @@ class AgenticStudioApp(ctk.CTk):
     # --------------------------------------------------------
     # CHAT HELPERS
     # --------------------------------------------------------
+    @staticmethod
+    def _chat_is_near_bottom(scroll_widget):
+        try:
+            return scroll_widget._parent_canvas.yview()[1] >= 0.97
+        except Exception:
+            return True
+
     def append_to_chat(self, sender, text, tag=None, chat_type="workspace"):
         if sender == "System":
             level = ("ok" if "✅" in text else "err" if "❌" in text
@@ -3701,6 +3943,7 @@ class AgenticStudioApp(ctk.CTk):
                     self._chat_row += 1
 
             elif sender == "Agent" and tag == "stream":
+                follow_output = self._chat_is_near_bottom(scroll_widget)
                 if is_gen:
                     self._general_stream_text_acc += text
                     if self._general_stream_label:
@@ -3709,7 +3952,8 @@ class AgenticStudioApp(ctk.CTk):
                     self._stream_text_acc += text
                     if self._stream_label:
                         self._stream_label.configure(text=self._stream_text_acc)
-                self.after(30, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
+                if follow_output:
+                    self.after(30, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
 
         self.after(0, _do)
 
@@ -3718,6 +3962,7 @@ class AgenticStudioApp(ctk.CTk):
             self._last_agent_response = full_text
             is_gen = (chat_type == "general")
             scroll_widget = self.general_scroll if is_gen else self.chat_scroll
+            follow_output = self._chat_is_near_bottom(scroll_widget)
             frame = self._general_stream_agent_frame if is_gen else self._stream_agent_frame
             row_idx = self._general_chat_row - 1 if is_gen else self._chat_row - 1
 
@@ -3751,7 +3996,8 @@ class AgenticStudioApp(ctk.CTk):
                     self._update_msg_count()
                 if self.voice_speak_replies:
                     self._speak_text(full_text)
-                self.after(60, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
+                if follow_output:
+                    self.after(60, lambda: scroll_widget._parent_canvas.yview_moveto(1.0))
         self.after(0, _do)
 
     def _show_typing(self):
@@ -3811,6 +4057,105 @@ class AgenticStudioApp(ctk.CTk):
         self.temp_label.configure(text=f"{val:.2f} — {desc}", text_color=color)
         self.db.set_setting("temperature", str(val))
 
+    def _on_decision_mode_changed(self, mode):
+        self.decision_mode = mode
+        self.db.set_setting("decision_mode", mode)
+        self.manual_strategy_combo.configure(
+            state="normal" if mode == "Manual" else "disabled")
+
+    def _on_manual_strategy_changed(self, strategy):
+        self.manual_strategy = strategy
+        self.db.set_setting("manual_strategy", strategy)
+
+    def _save_review_operations(self):
+        self.review_operations = self.review_operations_var.get()
+        self.db.set_setting("review_operations",
+                            "1" if self.review_operations else "0")
+
+    def _confirm_run_plan(self, directives, export_requested):
+        if not self.review_operations:
+            return True
+        selected_names = [os.path.basename(path) for path in self.selected_files]
+        files_text = ", ".join(selected_names) if selected_names else "None (create from directives)"
+        if self.decision_mode == "Manual":
+            strategy_text = f"Manual: {self.manual_strategy}"
+        else:
+            strategy_text = "LAYA will recommend a strategy"
+        export_text = (f"{self.output_format_var.get()} → {self.output_path_var.get()}"
+                       if export_requested else "No file export")
+        code_text = ("Disabled during file export" if export_requested else
+                     "Enabled (AI Python execution is opt-in)" if self.allow_generated_code
+                     else "Disabled")
+        plan = (
+            f"Sources: {files_text}\n"
+            f"Provider: {self.model_mgr.provider_type} at {self.model_mgr.endpoint}\n"
+            f"Model: {self.model_var.get()}\n"
+            f"Decision: {strategy_text}\n"
+            f"Response approach: {self.response_style}\n"
+            f"Export: {export_text}\n"
+            f"Generated Python: {code_text}\n\n"
+            f"Directive preview:\n{directives[:700]}"
+            f"{'…' if len(directives) > 700 else ''}\n\n"
+            "Proceed with document extraction and model requests?")
+        return messagebox.askyesno("Review Run Plan", plan, icon="question")
+
+    def _response_style_guidance(self):
+        guidance = {
+            "Conservative": (
+                "Prefer lower-risk, well-established options. Make assumptions "
+                "explicit, flag uncertainty, and avoid unsupported claims."),
+            "Balanced": (
+                "Compare practical options and tradeoffs, recommend a suitable "
+                "choice, and include meaningful alternatives and risks."),
+            "Exploratory": (
+                "Actively consider creative, unconventional, and non-obvious "
+                "alternatives, including ambitious options. Compare their "
+                "benefits, assumptions, feasibility, and risks; do not choose "
+                "an option solely because it is the safest or most conventional."),
+        }
+        return guidance.get(self.response_style, guidance["Balanced"])
+
+    def _resolve_analysis_strategy(self, directives):
+        if self.decision_mode == "Manual":
+            strategy = MANUAL_STRATEGIES.get(
+                self.manual_strategy,
+                MANUAL_STRATEGIES["Analyze and summarize"])
+            self.append_to_terminal(
+                "info", f"Using user-selected strategy: {self.manual_strategy}")
+            self.db.log_query(self.session_id, directives,
+                              f"Manual: {self.manual_strategy}", "")
+            return strategy
+
+        if not decision_engine:
+            self.append_to_terminal(
+                "warn", "LAYA decision engine is unavailable; using the default synthesis strategy. "
+                "Manual strategy selection remains available.")
+            return "Default Synthesis"
+
+        try:
+            result = decision_engine.predict(
+                state=(f"User Request:\n{directives}\n\n"
+                       f"Requested response approach: {self.response_style}.\n"
+                       f"{self._response_style_guidance()}"),
+                questions={"strategy": {
+                    "type": "choice",
+                    "instructions": (
+                        "Choose the analytical strategy that best fits the user "
+                        f"request and {self.response_style} response approach. "
+                        "Do not automatically prefer the safest or most conventional "
+                        "strategy unless the user selected Conservative."),
+                    "criteria": {
+                        "code_execution": "Write a python script",
+                        "data_extraction": "Pull specific values",
+                        "comparison": "Compare files"
+                    }}})
+            strategy = result.get("answers", result)
+            self.db.log_query(self.session_id, directives, str(strategy), "")
+            return strategy
+        except Exception as exc:
+            self.append_to_terminal("warn", f"LAYA: {exc}")
+            return "Default Synthesis"
+
     # --------------------------------------------------------
     # SELF-HEALING EXECUTION ENGINE
     # --------------------------------------------------------
@@ -3829,9 +4174,18 @@ class AgenticStudioApp(ctk.CTk):
             "not support dash=, so draw dashed lines as segments."
         )
 
-    def execute_agent_code(self, llm_response, max_retries=5):
+    def execute_agent_code(self, llm_response, max_retries=5,
+                           export_requested=False):
         blocks = re.findall(r'```python\n(.*?)\n```', llm_response, re.DOTALL)
         if not blocks: return
+        if export_requested:
+            self.append_to_terminal(
+                "info", "Generated Python was not run during document export.")
+            return
+        if not self.allow_generated_code:
+            self.append_to_terminal(
+                "info", "Generated Python was not run. Enable it in Preferences to execute AI scripts.")
+            return
         self.is_executing = True
         self.set_status("Executing generated script…", "busy")
         source_files = [os.path.abspath(path) for path in self.selected_files
@@ -3924,27 +4278,32 @@ class AgenticStudioApp(ctk.CTk):
         if self.is_processing: return
         directives = self.prompt_text.get("0.0", "end").strip()
         temperature = round(self.temp_var.get(), 2)
+        export_requested = self.export_var.get()
         if not self.model_mgr.is_configured:
             messagebox.showerror("Model Provider",
                 "Configure a model provider and endpoint before running analysis.")
             return
-        if self.export_var.get() and not self.output_path_var.get().strip():
+        if export_requested and not self.output_path_var.get().strip():
             self.browse_output()
             if not self.output_path_var.get().strip():
                 return
-        if self.export_var.get():
+        if export_requested:
             directives += (
                 f"\n\nPrepare the completed response as a polished, complete "
                 f"{self.output_format_var.get()} document. Return the document content "
                 "directly; the application will save it in the selected format. "
                 "Do not write a file-generation script."
             )
+        if not self._confirm_run_plan(directives, export_requested):
+            self.set_status("Operation cancelled", "idle")
+            return
         self.right_tabs.set("  💬 Workspace  ")
         self.after(0, lambda: self.toggle_processing_state(True))
         threading.Thread(target=self.run_initial_agent,
-                         args=(directives, temperature), daemon=True).start()
+                         args=(directives, temperature, export_requested),
+                         daemon=True).start()
 
-    def run_initial_agent(self, directives, temperature):
+    def run_initial_agent(self, directives, temperature, export_requested=False):
         try:
             self.append_to_terminal("info",
                 f"Pipeline started. {len(self.selected_files)} file(s).")
@@ -3991,30 +4350,15 @@ class AgenticStudioApp(ctk.CTk):
             else:
                 self.document_context = master_raw
 
-            strategy = "Default Synthesis"
-            if decision_engine:
-                try:
-                    res = decision_engine.predict(
-                        state=f"User Request:\n{directives}",
-                        questions={"strategy": {
-                            "type": "choice",
-                            "instructions": "Determine analytical approach.",
-                            "criteria": {
-                                "code_execution": "Write a python script",
-                                "data_extraction": "Pull specific values",
-                                "comparison": "Compare files"
-                            }}})
-                    strategy = res.get("answers", res)
-                    self.db.log_query(self.session_id, directives,
-                                      str(strategy), "")
-                except Exception as e:
-                    self.append_to_terminal("warn", f"LAYA: {e}")
+            strategy = self._resolve_analysis_strategy(directives)
 
             self.append_to_terminal("info",
                 f"Synthesizing with {self.model_var.get()} (T={temperature})…")
             self._show_typing()
 
             sys_p = (f"You are a master data agent. Strategy: {strategy}\n"
+                     f"Response approach: {self.response_style}. "
+                     f"{self._response_style_guidance()}\n"
                      f"{self._script_runtime_context()}\n\n"
                      f"=== DATA ===\n{self.document_context}")
             t0 = time.time()
@@ -4045,9 +4389,10 @@ class AgenticStudioApp(ctk.CTk):
                               full[:300])
             self.db.upsert_session(self.session_id, len(self.selected_files),
                                    self._msg_count, self.model_var.get())
-            self.after(0, lambda response=full:
-                       self._save_generated_output(response))
-            self.execute_agent_code(full)
+            if export_requested:
+                self.after(0, lambda response=full:
+                           self._save_generated_output(response))
+            self.execute_agent_code(full, export_requested=export_requested)
 
         except Exception as e:
             self.append_to_terminal("err", f"CRITICAL: {e}")
@@ -4085,6 +4430,8 @@ class AgenticStudioApp(ctk.CTk):
 
             messages = [{"role": "system",
                          "content": (f"You are a helpful writing and data agent.\n\n"
+                                     f"Response approach: {self.response_style}. "
+                                     f"{self._response_style_guidance()}\n\n"
                                      f"{self._script_runtime_context()}\n\n"
                                      f"Context:\n{self.document_context or 'No source document context is available.'}\n\n"
                                      "Wrap Python scripts in ```python blocks.")}]
@@ -4157,7 +4504,10 @@ class AgenticStudioApp(ctk.CTk):
                    sum(len(m["content"]) for m in self._general_history) > MAX_HISTORY_CHARS):
                 self._general_history.pop(0)
 
-            messages = [{"role": "system", "content": "You are a general-purpose AI assistant. Provide helpful and concise answers."}]
+            messages = [{"role": "system", "content": (
+                "You are a general-purpose AI assistant. Provide helpful and concise answers. "
+                f"Response approach: {self.response_style}. "
+                f"{self._response_style_guidance()}")}]
             for r in self._general_history:
                 role = "assistant" if r["role"] == "agent" else r["role"]
                 messages.append({"role": role, "content": r["content"]})

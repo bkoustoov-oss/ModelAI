@@ -1,6 +1,10 @@
 .venv*/
 venv/
 __pycache__/
+/build/
+/dist/
+/.secrets/
+.venv-build/
 *.py[cod]
 *.db
 *.db-shm
